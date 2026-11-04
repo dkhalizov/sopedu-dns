@@ -61,6 +61,10 @@ jobs:
 
       - name: Check regressions
         if: steps.base_bench.outcome == 'success'
+        # Gates pull requests. On a push to main the change is already in, so a
+        # regression is reported (the step shows as failed) without failing the
+        # run; short benches can drift past +10% on a shared runner.
+        continue-on-error: ${{ github.event_name == 'push' }}
         run: python3 scripts/check_bench_regressions.py
 
       - name: Benchmark without a base

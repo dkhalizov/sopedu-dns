@@ -29,4 +29,6 @@ cargo bench --bench micro -- --baseline-lenient base
 python3 scripts/check_bench_regressions.py
 ```
 
+On a push to `main` the gate only reports: the step shows as failed but the run passes, because the change is already merged. Pull requests are gated.
+
 If the gate fails, rerun the job once: runner noise can move a short benchmark. If it fails again, the regression is real. Fix it, or say in the pull request why you accept the cost.
