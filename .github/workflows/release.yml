@@ -4,7 +4,7 @@ name: Release
 # static musl binaries with generated third-party licence notices, a SHA-256
 # checksum file and a CycloneDX SBOM, then creates a DRAFT GitHub Release for
 # the maintainer to review and publish by hand. Publishing it triggers
-# image.yml, which pushes the container image. Crates are published by hand.
+# image.yml (container image) and crates.yml (crates.io, after approval).
 on:
   push:
     tags: ['v*']

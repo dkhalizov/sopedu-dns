@@ -6,7 +6,7 @@ release on we follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.0.0] - unreleased
+## [1.0.0] - 2026-11-04
 
 First public release.
 
