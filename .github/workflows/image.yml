@@ -1,0 +1,52 @@
+name: Image
+
+# Runs when the maintainer publishes a GitHub Release (not while it is a
+# draft). It downloads that release's static binaries, checks them against
+# SHA256SUMS and pushes a multi-arch image to ghcr.io. Nothing is compiled
+# here, so the image holds exactly the released binaries.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download and verify the release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir dl && cd dl
+          gh release download "$TAG" --repo "$REPO" --pattern 'sopedu-dns-*-linux-musl.tar.gz' --pattern SHA256SUMS
+          sha256sum --check --ignore-missing SHA256SUMS
+          for pair in x86_64:amd64 aarch64:arm64; do
+            name="sopedu-dns-$TAG-${pair%%:*}-unknown-linux-musl"
+            mkdir -p "../dist/${pair##*:}"
+            tar -xzf "$name.tar.gz" --strip-components=1 -C "../dist/${pair##*:}" "$name/sopedu-dns"
+          done
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          REPO: ${{ github.repository }}
+        run: |
+          image="ghcr.io/${REPO,,}"
+          tags="-t $image:${TAG#v}"
+          [ "$PRERELEASE" = true ] || tags="$tags -t $image:latest"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker buildx create --use --driver docker-container
+          docker buildx build --platform linux/amd64,linux/arm64 --build-arg BINARIES=prebuilt \
+            --provenance=mode=max --sbom=true $tags --push .

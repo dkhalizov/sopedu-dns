@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-dnsperf
+spec:
+  nodeName: CLIENT_NODE_NAME
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: dnsperf
+      image: dnsperf-bench:amd64
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]
+      # The client may use at most 2 CPUs (the node also hosts other workloads).
+      resources:
+        requests:
+          cpu: "1"
+        limits:
+          cpu: "2"
+      volumeMounts:
+        - name: inputs
+          mountPath: /data
+          readOnly: true
+  volumes:
+    - name: inputs
+      hostPath:
+        path: /tmp/sopedu-bench/inputs
+        type: Directory

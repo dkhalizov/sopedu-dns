@@ -1,0 +1,113 @@
+name: sopedu-bench
+
+# Every server is published on the same host port and run one at a time, so
+# the client command and the network path are identical across servers.
+# All servers share one local upstream (bench/upstream-mock: plain UDP/TCP on
+# 5300 and DoH/h2 on 8443, fixed added delay) and one local list server
+# (the same four list files, over HTTP), so neither the transport nor the
+# Internet differs between servers. Start with: ./run.sh
+
+# Equal, stable resources for every server. One CPU makes the comparison a
+# throughput-per-core test. 512 MiB because AdGuard Home with the shared
+# lists is OOM-killed at 256 MiB. Swap is disabled so a server
+# that exceeds the limit is killed instead of silently spilling.
+x-resources: &resources
+  cpus: "1.0"
+  mem_limit: ${MEM_LIMIT:-512m}
+  memswap_limit: ${MEM_LIMIT:-512m}
+
+x-server: &server
+  <<: *resources
+  networks: [bench]
+  ports:
+    - "${PORT:-15353}:53/udp"
+    - "${PORT:-15353}:53/tcp"
+  environment:
+    SSL_CERT_FILE: /tls/ca.pem
+  restart: "no"
+
+services:
+  upstream:
+    profiles: ["infra"]
+    image: upstream-mock:bench
+    build: ../upstream-mock
+    container_name: bench-upstream
+    command: ["--listen", "0.0.0.0:5300", "--doh", "0.0.0.0:8443", "--cert", "/tls/cert.der",
+              "--key", "/tls/key.der", "--delay-ms", "${UPSTREAM_DELAY_MS:-10}"]
+    volumes:
+      - ./.run/tls:/tls:ro
+    networks:
+      bench: {ipv4_address: 172.29.0.53}
+
+  lists:
+    profiles: ["infra"]
+    image: python:3.14-alpine
+    container_name: bench-lists
+    command: ["python", "-m", "http.server", "8080", "-d", "/lists"]
+    volumes:
+      - ${LISTS_DIR:-../corpus/lists}:/lists:ro
+    networks:
+      bench: {ipv4_address: 172.29.0.80}
+
+  sopedu:
+    profiles: ["sopedu"]
+    <<: *server
+    build:
+      context: ${SOPEDU_SRC:-../..}
+      dockerfile: Dockerfile
+    image: sopedu-bench:local
+    container_name: bench-sopedu
+    command: ["/etc/sopedu-dns/config.toml"]
+    volumes:
+      - ./.run/sopedu:/etc/sopedu-dns:ro
+      - ./.run/tls:/tls:ro
+      - sopedu-state:/state
+
+  agh:
+    profiles: ["agh"]
+    <<: *server
+    image: adguard/adguardhome:v0.107.79
+    container_name: bench-agh
+    volumes:
+      - ./.run/agh:/opt/adguardhome/conf
+      - ./.run/tls:/tls:ro
+      - agh-work:/opt/adguardhome/work
+
+  pihole:
+    profiles: ["pihole"]
+    <<: *server
+    image: pihole/pihole:2026.10.1
+    container_name: bench-pihole
+    environment:
+      TZ: UTC
+      FTLCONF_dns_upstreams: "172.29.0.53#5300"
+      FTLCONF_dns_listeningMode: "all"
+      FTLCONF_dns_blocking_active: "true"
+      FTLCONF_dns_cache_size: "10000"
+      # Pi-hole's default limit (1000 queries / 60 s per client) answers
+      # REFUSED under load; FTLCONF_dns_rateLimit_count=0 disables it.
+      FTLCONF_dns_rateLimit_count: "0"
+      FTLCONF_webserver_api_password: "bench"
+    volumes:
+      - pihole-etc:/etc/pihole
+      - ./configs/pihole-lists.sh:/pihole-lists.sh:ro
+
+  blocky:
+    profiles: ["blocky"]
+    <<: *server
+    image: ghcr.io/0xerr0r/blocky:v0.35.0
+    container_name: bench-blocky
+    volumes:
+      - ./.run/blocky/config.yml:/app/config.yml:ro
+      - ./.run/tls:/tls:ro
+
+networks:
+  bench:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  sopedu-state:
+  agh-work:
+  pihole-etc:

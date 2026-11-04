@@ -1,0 +1,7 @@
+# Every HTTPS client must come from `tls::client_builder()`: reqwest is built
+# without a default crypto provider, so the plain constructors would panic.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use sopedu_dns::tls::client_builder()" },
+    { path = "reqwest::Client::builder", reason = "use sopedu_dns::tls::client_builder()" },
+    { path = "reqwest::get", reason = "use sopedu_dns::tls::client_builder()" },
+]

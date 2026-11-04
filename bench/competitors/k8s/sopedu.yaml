@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-sopedu
+spec:
+  nodeName: NODE_NAME
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: sopedu
+      image: sopedu-bench:amd64
+      imagePullPolicy: Never
+      command: ["/sopedu-dns", "/etc/sopedu-dns/config.toml"]
+      env:
+        - name: SSL_CERT_FILE
+          value: /tls/ca.pem
+      resources:
+        requests:
+          cpu: "1"
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      volumeMounts:
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+        - name: conf
+          mountPath: /etc/sopedu-dns
+          readOnly: true
+        - name: state
+          mountPath: /state
+  volumes:
+    - name: conf
+      hostPath:
+        path: /tmp/sopedu-bench/sopedu
+        type: Directory
+    - name: state
+      emptyDir: {}
+    - name: tls
+      hostPath:
+        path: /tmp/sopedu-bench/tls
+        type: Directory

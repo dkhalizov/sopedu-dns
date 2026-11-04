@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-dnsmasq
+spec:
+  nodeName: NODE_NAME
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: dnsmasq
+      image: ref-bench:amd64
+      imagePullPolicy: Never
+      command: ["dnsmasq", "-k", "--conf-file=/etc/ref/dnsmasq.conf"]
+      resources:
+        requests:
+          cpu: "1"
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      volumeMounts:
+        - name: conf
+          mountPath: /etc/ref
+          readOnly: true
+  volumes:
+    - name: conf
+      hostPath:
+        path: /tmp/sopedu-bench/dnsmasq
+        type: Directory

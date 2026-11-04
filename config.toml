@@ -1,0 +1,20 @@
+# Minimal home-LAN config: DNS on port 53, DoH upstreams, one blocklist.
+# Run `sopedu-dns` (reads ./config.toml); validate with
+# `sopedu-dns --check config.toml`. Port 53 needs root or CAP_NET_BIND_SERVICE.
+# To try it unprivileged, set listen = "127.0.0.1:15353".
+# config.example.toml explains the common options; docs/configuration.md lists all.
+
+listen = "0.0.0.0:53"
+upstreams = ["https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query", "https://8.8.8.8/dns-query"]
+cache_size = 10000
+state_dir = "state"
+blocklists = ["https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"]
+refresh_hours = 24
+
+# Clients that skip the blocklists. They still use the cache and upstreams.
+# no_filter_clients = ["192.168.1.20"]
+
+# Local names: exact names and "*.suffix" wildcards.
+[rewrites]
+"nas.home.arpa" = "192.168.1.10"
+"*.apps.home.arpa" = "192.168.1.11"

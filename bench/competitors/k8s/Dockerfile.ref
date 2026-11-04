@@ -1,0 +1,8 @@
+# Neutral reference servers for the harness: Unbound and dnsmasq from Debian
+# trixie, one image, started with different commands by k8s/unbound.yaml and
+# k8s/dnsmasq.yaml. Built locally and imported on the server node only.
+FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends unbound dnsmasq-base dnsmasq \
+    && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]

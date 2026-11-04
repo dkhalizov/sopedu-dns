@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 11d8ee0022733fb6a7f52a3f3a6cfae2e71f1a5e6bda34599c0b938ef85ee903 # shrinks to message = Message { metadata: Metadata { id: 0, message_type: Response, op_code: Query, authoritative: false, truncation: false, recursion_desired: false, recursion_available: false, authentic_data: false, checking_disabled: false, response_code: NoError }, queries: [Query { name: Name("a."), query_type: A, query_class: IN }], answers: [], authorities: [], additionals: [Record { name: Name("a."), dns_class: IN, ttl: 1894851263, data: A(A(0.0.0.0)) }], signature: None, edns: None }, age = 0, stale = true, new_id = 0

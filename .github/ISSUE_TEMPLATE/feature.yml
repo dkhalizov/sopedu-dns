@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a change or a new feature.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: "The behaviour you want, with the RFC section if one applies."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - label: "I checked \"What it doesn't do\" in the README (no recursion, DNSSEC validation, encrypted listeners, DHCP or editing from the UI)."
+          required: true

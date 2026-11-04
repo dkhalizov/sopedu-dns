@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>sopedu-dns third-party licenses</title>
+</head>
+<body>
+<h1>Third-party licenses</h1>
+<h2>Overview</h2>
+<ul>
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+{{/each}}
+</ul>
+<h2>Licenses</h2>
+{{#each licenses}}
+<section id="{{id}}">
+  <h3>{{name}}</h3>
+  <p>Used by:</p>
+  <ul>
+  {{#each used_by}}
+    <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+  {{/each}}
+  </ul>
+  <pre>{{text}}</pre>
+</section>
+{{/each}}
+</body>
+</html>

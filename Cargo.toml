@@ -1,0 +1,95 @@
+[package]
+name = "sopedu-dns"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Small caching DNS-over-HTTPS forwarder with ad blocking, built for strict RFC conformance"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["dns", "adblock", "dns-over-https", "forwarder"]
+categories = ["network-programming", "command-line-utilities"]
+repository = "https://github.com/dkhalizov/sopedu-dns"
+include = ["/src/**", "/benches/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/CHANGELOG.md", "/LICENSE-*", "/config.example.toml"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Allocator choice is opt-in so the shipped musl build keeps the
+# platform allocator. The two features are mutually exclusive.
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+# Measurement only: counts every heap call in the
+# real server and writes dhat-heap.json at shutdown. Excludes the two above.
+dhat-heap = ["dep:dhat"]
+# Test-only instrumentation adapter for an external black-box conformance
+# driver. Never part of a shipped build: it swaps the
+# monotonic clock for tokio's pausable one and adds observation hooks.
+conformance-adapter = ["tokio/test-util", "dep:serde_json"]
+
+[dependencies]
+arc-swap = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "sync"] }
+hickory-proto = { version = "0.26", default-features = false }
+# Outbound TLS uses the rustls ClientConfig built in src/tls.rs: the ring
+# provider (no aws-lc-rs/aws-lc-sys in the static musl builds) and the
+# system trust store via rustls-native-certs
+# (SSL_CERT_FILE in the scratch image), never the CDLA-licensed webpki roots.
+# `rustls-no-provider` still compiles rustls-platform-verifier; the
+# preconfigured ClientConfig bypasses it.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+serde = { version = "1", features = ["derive"] }
+# Read-only /healthz + /metrics listener (src/http.rs). All three are already
+# in Cargo.lock through reqwest; only the server-side features are new.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+toml = "1"
+foldhash = "0.2"
+quick_cache = "0.7"
+# Retry-After HTTP-dates (RFC 9110 §10.2.3); already in Cargo.lock through hyper.
+httpdate = "1"
+rand = "0.10"
+socket2 = { version = "0.6", features = ["all"] }
+# Optional global allocators (non-default features above).
+mimalloc = { version = "0.1", optional = true }
+tikv-jemallocator = { version = "0.7", optional = true }
+dhat = { version = "0.3", optional = true }
+# JSONL protocol of the `conformance-adapter` feature only.
+serde_json = { version = "1", optional = true }
+
+# Batched UDP syscalls are Linux-only. `net` provides the safe
+# SockaddrStorage <-> SocketAddr conversions the recvmmsg summaries need;
+# without it those conversions require `unsafe`, which this project forbids.
+# The same safe wrappers carry the IP_PKTINFO control messages of
+# src/udp_pktinfo.rs (Linux and macOS), so the dependency covers both.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { version = "0.31", features = ["net", "socket", "uio"] }
+
+[dev-dependencies]
+criterion = "0.8"
+dhat = "0.3"
+proptest = "1.12"
+moka = { version = "0.12", features = ["sync"] }
+tinyufo = { package = "TinyUFO", version = "0.9" }
+
+[[bench]]
+name = "micro"
+harness = false
+
+[[bench]]
+name = "alloc"
+harness = false
+
+[[bench]]
+name = "blocklist_1m"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

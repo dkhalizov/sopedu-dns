@@ -1,0 +1,12 @@
+# @UP@: [] (plain fallback only) or ["https://.../dns-query"] (DoH, plain fallback).
+listen = "0.0.0.0:@PORT@"
+upstreams = @UP@
+fallback = ["@PLAIN@"]
+upstream_0x20 = false
+cache_size = 20000
+cache_bytes = 8388608
+optimistic_max_age = "12h"
+state_dir = "/state"
+blocklists = ["@LISTS@/filter_1.txt", "@LISTS@/filter_24.txt", "@LISTS@/filter_27.txt", "@LISTS@/filter_51.txt"]
+user_rules = []
+no_filter_clients = []

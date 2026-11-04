@@ -1,0 +1,19 @@
+# Default config in the container image, at /etc/sopedu-dns/config.toml.
+# Mount your own file over it:
+#   docker run -v ./my.toml:/etc/sopedu-dns/config.toml:ro ...
+#
+# SECURITY: listens on 0.0.0.0:53 and relies on the default allowed_clients
+# (private ranges only). Run the container with `--network host`
+# (plus `--user 0 --cap-drop ALL --cap-add NET_BIND_SERVICE`) so clients keep
+# their real source addresses. Behind a bridge, rootless Docker, Docker
+# Desktop or the userland proxy, every client can appear as the private
+# bridge gateway and pass the check. With `-p 53:53`, set a narrow
+# allowed_clients here. Never publish port 53 on a public interface.
+listen = "0.0.0.0:53"
+
+# The image declares this directory a VOLUME owned by uid 65532, so cached
+# blocklists survive restarts.
+state_dir = "/var/lib/sopedu-dns"
+
+# UI off: it has no login, and the host cannot reach the container's loopback.
+ui_enabled = false

@@ -1,0 +1,21 @@
+# Benchmark upstream (plain DNS + DoH/h2 with controlled latency). A separate
+# package so the server's Cargo.toml/Cargo.lock stay untouched; every crate
+# here is already in the server's dependency tree (hickory, tokio, h2, rustls).
+[package]
+name = "upstream-mock"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+hickory-proto = { version = "0.26", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+[profile.release]
+codegen-units = 1

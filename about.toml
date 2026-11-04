@@ -1,0 +1,21 @@
+# cargo-about configuration: https://embarkstudios.github.io/cargo-about/
+# Keep in sync with [licenses] allow in deny.toml.
+# Notices cover what ships in the binary, not benchmark/test-only crates.
+# Only the shipped targets, so wasm32-only crates that never reach the binary
+# (webpki-root-certs through rustls-platform-verifier) are not listed.
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+]

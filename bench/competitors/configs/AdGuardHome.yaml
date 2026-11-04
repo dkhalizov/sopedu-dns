@@ -1,0 +1,30 @@
+# @UP@: host:port (plain UDP) or https://.../dns-query (DoH).
+schema_version: 34
+http:
+  address: 0.0.0.0:3000
+users: []
+dns:
+  bind_hosts:
+    - 0.0.0.0
+  port: @PORT@
+  upstream_dns:
+    - @UP@
+  bootstrap_dns:
+    - @PLAIN@
+  ratelimit: 0
+  enable_dnssec: false
+  cache_enabled: true
+  cache_size: 8388608
+filtering:
+  protection_enabled: true
+  filtering_enabled: true
+  filters_update_interval: 24
+filters:
+  - {enabled: true, url: "@LISTS@/filter_1.txt", name: f1, id: 1}
+  - {enabled: true, url: "@LISTS@/filter_24.txt", name: f24, id: 2}
+  - {enabled: true, url: "@LISTS@/filter_27.txt", name: f27, id: 3}
+  - {enabled: true, url: "@LISTS@/filter_51.txt", name: f51, id: 4}
+querylog:
+  enabled: false
+statistics:
+  enabled: false

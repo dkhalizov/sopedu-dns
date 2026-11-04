@@ -1,0 +1,42 @@
+name: Benchmark result or dispute
+description: Report your own measurements, or dispute a published number or competitor config.
+labels: [benchmark]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Follow the benchmark rules in CONTRIBUTING.md. We cannot compare
+        results without hardware, versions and the number of runs.
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and OS
+      description: "CPU, cores given to the server, RAM, kernel, NIC, governor. Does the client run on a separate host?"
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions
+      description: "sopedu-dns commit or tag, every competitor version or image digest, client tool and version."
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Method
+      description: "Profile, phases, query rate (open loop?), corpus, upstream, each server's config. If you used `bench/competitors/run.sh`, link its output."
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: "Median and min-max of at least 3 runs, with loss and latency percentiles. Attach the raw output."
+    validations:
+      required: true
+  - type: textarea
+    id: dispute
+    attributes:
+      label: Disputed claim or config (optional)
+      description: "Which published number or competitor setting is unfair, and why."

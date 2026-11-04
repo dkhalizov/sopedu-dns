@@ -1,0 +1,10 @@
+/target/
+/.idea/
+/config.local.toml
+/state/
+/bench/corpus/
+/bench/competitors/.run/
+/bench/competitors/results/
+/bench/paths/.run/
+/bench/upstream-mock/target/
+__pycache__/

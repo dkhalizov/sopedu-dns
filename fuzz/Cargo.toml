@@ -1,0 +1,35 @@
+[package]
+name = "sopedu-dns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sopedu-dns]
+path = ".."
+
+[[bin]]
+name = "wire_parser"
+path = "fuzz_targets/wire_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rule_parser"
+path = "fuzz_targets/rule_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "upstream_response"
+path = "fuzz_targets/upstream_response.rs"
+test = false
+doc = false
+bench = false

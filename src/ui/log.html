@@ -1,0 +1,16 @@
+<form class="filters" method="get" action="/log">
+  {{form}}
+  <button type="submit">Filter</button>
+</form>
+<div class="bar">
+  <button type="button" id="pause">Pause</button>
+  <span id="state" class="muted" role="status">Connecting</span>
+  <span class="muted">Rules shown for copying; this page changes nothing.</span>
+</div>
+<div class="scroll">
+  <table class="log">
+    <thead><tr><th>Time</th><th>Client</th><th>Domain</th><th>Type</th><th>Result</th><th class="num">Latency</th><th>Rule</th></tr></thead>
+    <tbody id="rows">{{rows}}</tbody>
+  </table>
+</div>
+<p class="muted" id="note">{{note}}</p>

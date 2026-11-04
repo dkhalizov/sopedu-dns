@@ -1,0 +1,35 @@
+name: Bug report
+description: Behaviour that differs from the docs or an RFC.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security problems here. Use private vulnerability
+        reporting (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "Release version, commit or container image digest."
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: "A minimal config, with private hostnames and addresses removed, and the query, for example a `dig` command."
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      description: OS, architecture, container or bare binary.

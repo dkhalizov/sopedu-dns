@@ -1,0 +1,64 @@
+# cargo-deny configuration: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Check the crates that can be compiled for a target we build or ship: the
+# static musl release binaries and Docker image, Linux CI, and macOS
+# development. Target-specific dependencies of other platforms are left out;
+# notably webpki-root-certs (CDLA-Permissive-2.0), which reqwest 0.13 pulls
+# in only for wasm32 through rustls-platform-verifier and which src/tls.rs
+# never uses. On these targets the CDLA licence is still rejected.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# Vulnerabilities are always denied by cargo-deny. Unmaintained advisories are
+# checked for every crate in the graph (newer cargo-deny only supports a scope
+# here, not a warn/deny level); yanked versions are denied.
+unmaintained = "all"
+# Fail on unsound advisories in transitive crates too, not just the workspace.
+unsound = "all"
+yanked = "deny"
+
+[licenses]
+# Project license policy: copyleft and unknown licenses are not allowed.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+]
+
+# This is an application, not a published library, so the license of the
+# workspace crate itself is not part of the dependency policy.
+[licenses.private]
+ignore = true
+
+[sources]
+# Dependencies must come from crates.io; no git or unknown registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[bans]
+# Duplicate versions are reported, not fatal: some come from upstream crates.
+multiple-versions = "warn"
+
+# NCSA (LLVM's permissive BSD-style license) only for the fuzzing runtime,
+# which is never part of a shipped binary.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys"
+allow = ["NCSA"]

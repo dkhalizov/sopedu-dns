@@ -1,0 +1,155 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sopedu-dns
+data:
+  config.toml: |
+    # hostNetwork on a dual-stack LAN: use an array, for example
+    # listen = ["192.168.1.11:53", "[2001:db8::11]:53"]. IPv6 sockets are
+    # V6ONLY, so "0.0.0.0:53" plus "[::]:53" also works.
+    listen = "0.0.0.0:53"
+    # /healthz and /metrics. The readinessProbe below checks it on loopback.
+    ui_listen = "127.0.0.1:9999"
+    upstreams = ["https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query", "https://8.8.8.8/dns-query"]
+    cache_size = 10000
+    optimistic_max_age = "12h"
+    state_dir = "/state"
+    blocklists = [
+      "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
+      "https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt",
+      "https://adguardteam.github.io/HostlistsRegistry/assets/filter_51.txt",
+      "https://adguardteam.github.io/HostlistsRegistry/assets/filter_27.txt",
+    ]
+    refresh_hours = 24
+    # Allow rules, for example "@@||example.org^$important".
+    # user_rules = []
+    # Clients that skip the blocklists.
+    # no_filter_clients = ["192.168.1.20"]
+
+    [rewrites]
+    "nas.home.arpa" = "192.168.1.10"
+    "*.apps.home.arpa" = "192.168.1.11"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sopedu-dns
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # With hostNetwork a surge pod needs a third node. Replace one pod at a
+      # time; the other keeps serving :53.
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: sopedu-dns
+  template:
+    metadata:
+      labels:
+        app: sopedu-dns
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # The process never calls the Kubernetes API, so no token is mounted.
+      automountServiceAccountToken: false
+      # Two hostNetwork pods on one node would both bind 0.0.0.0:53, so allow
+      # one replica per node. On a single-node cluster the second pod stays
+      # Pending and an update cannot complete: the new pod waits while the old
+      # one keeps serving.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: sopedu-dns
+              topologyKey: kubernetes.io/hostname
+      # The kubelet creates the emptyDir owned by root and the container runs
+      # as uid 0, so /state is writable without fsGroup; fsGroup 0 is
+      # redundant. readOnlyRootFilesystem covers the container rootfs only,
+      # not this volume.
+      securityContext:
+        fsGroup: 0
+        fsGroupChangePolicy: OnRootMismatch
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: sopedu-dns
+          image: ghcr.io/dkhalizov/sopedu-dns:1.0.0
+          imagePullPolicy: IfNotPresent
+          # Port 53 needs CAP_NET_BIND_SERVICE. Kubernetes gives non-root
+          # processes no ambient capabilities, and
+          # allowPrivilegeEscalation: false (no_new_privs) blocks a file
+          # capability, so the container runs as uid 0 with only
+          # NET_BIND_SERVICE and a read-only root filesystem. We skip the
+          # net.ipv4.ip_unprivileged_port_start sysctl: with hostNetwork it
+          # changes the whole node.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+              add: [NET_BIND_SERVICE]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+          startupProbe:
+            tcpSocket:
+              port: 53
+            periodSeconds: 10
+            failureThreshold: 90
+          # Liveness: the DNS listener accepts connections. Readiness
+          # (/healthz) also needs rules loaded and one working upstream path.
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            periodSeconds: 10
+          # With hostNetwork the kubelet dials the node IP by default, but the
+          # UI listens on 127.0.0.1:9999 (ui_listen default), so the probe
+          # sets the host. Readiness gates rollouts; it does not steer DNS
+          # traffic.
+          readinessProbe:
+            httpGet:
+              host: 127.0.0.1
+              path: /healthz
+              port: 9999
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sopedu-dns
+              readOnly: true
+            - name: state
+              mountPath: /state
+      volumes:
+        - name: config
+          configMap:
+            name: sopedu-dns
+        - name: state
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sopedu-dns
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sopedu-dns

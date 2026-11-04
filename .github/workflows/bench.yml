@@ -1,0 +1,73 @@
+name: Bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege for every job. Nothing here needs to write to the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Base and head run back to back in this job, on this runner, so the gate
+  # compares two builds measured on the same VM instead of a cached baseline
+  # from a different machine. Criterion stays the tool for local runs.
+  micro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Resolve base commit
+        id: base
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "sha=$BASE" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No base commit (first push or force push); the regression gate is skipped."
+          fi
+
+      # The base tree's own benches/micro.rs runs, so a benchmark added by the
+      # head has no baseline and is reported, not gated (--baseline-lenient).
+      - name: Benchmark base on this runner
+        id: base_bench
+        if: steps.base.outputs.sha != ''
+        continue-on-error: true
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/target/criterion
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          rm -rf "$CRITERION_HOME"   # never compare against a restored stale run
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          cd "$RUNNER_TEMP/base"
+          cargo bench --locked --bench micro -- --save-baseline base
+
+      - name: Benchmark head against base
+        if: steps.base_bench.outcome == 'success'
+        env:
+          CRITERION_HOME: ${{ github.workspace }}/target/criterion
+        run: cargo bench --locked --bench micro -- --baseline-lenient base
+
+      - name: Check regressions
+        if: steps.base_bench.outcome == 'success'
+        run: python3 scripts/check_bench_regressions.py
+
+      - name: Benchmark without a base
+        if: steps.base_bench.outcome != 'success'
+        run: |
+          echo "::notice::Base benchmark unavailable; running head only, no gate."
+          cargo bench --locked --bench micro
+
+      - name: Regression script self-test
+        run: python3 scripts/check_bench_regressions.py --self-test

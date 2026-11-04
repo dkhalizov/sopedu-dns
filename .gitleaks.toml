@@ -1,0 +1,8 @@
+# Default gitleaks rules, minus the throwaway key of the TLS test fixtures
+# (tests/tls/gen.sh makes it; it signs only a 127.0.0.1 test certificate).
+[extend]
+useDefault = true
+
+[allowlist]
+description = "TLS test fixtures"
+paths = ['''^tests/tls/leaf\.key$''']

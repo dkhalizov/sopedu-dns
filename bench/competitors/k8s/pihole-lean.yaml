@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-pihole-lean
+spec:
+  nodeName: NODE_NAME
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: pihole
+      image: pihole/pihole:2026.10.1
+      env:
+        - name: TZ
+          value: UTC
+        - name: FTLCONF_dns_upstreams
+          value: "UPSTREAM_IP#5300"
+        - name: FTLCONF_dns_port
+          value: "15353"
+        - name: FTLCONF_dns_listeningMode
+          value: all
+        - name: FTLCONF_dns_blocking_active
+          value: "true"
+        - name: FTLCONF_dns_cache_size
+          value: "10000"
+        - name: FTLCONF_dns_rateLimit_count
+          value: "0"
+        # Lean variant: no dnsmasq query log, no query database, privacy level 3
+        # (nothing stored per query). Defaults log every query to pihole.log and
+        # write each one to the SQLite database.
+        - name: FTLCONF_dns_queryLogging
+          value: "false"
+        - name: FTLCONF_database_maxDBdays
+          value: "0"
+        - name: FTLCONF_misc_privacylevel
+          value: "3"
+        - name: FTLCONF_webserver_api_password
+          value: bench
+      resources:
+        requests:
+          cpu: "1"
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      volumeMounts:
+        - name: etc
+          mountPath: /etc/pihole
+  volumes:
+    - name: etc
+      emptyDir: {}

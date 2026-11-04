@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Keep the pinned SHAs current; a new action version arrives as a PR.
+    groups:
+      github-actions:
+        patterns: ["*"]
+  - package-ecosystem: cargo
+    directories: ["/", "/fuzz", "/bench/upstream-mock"]
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  # Refreshes the @sha256 digests on the FROM lines. Dockerfile.dnsperf under
+  # bench/competitors/k8s is not detected by name; bump it by hand.
+  - package-ecosystem: docker
+    directories: ["/", "/bench/upstream-mock"]
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]

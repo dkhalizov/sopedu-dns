@@ -1,0 +1,26 @@
+# @UP@: host:port (plain UDP) or https://.../dns-query (DoH).
+ports:
+  dns: 0.0.0.0:@PORT@
+log:
+  level: warn
+queryLog:
+  type: none
+caching:
+  maxItemsCount: 20000
+upstreams:
+  groups:
+    default:
+      - @UP@
+blocking:
+  denylists:
+    shared:
+      - @LISTS@/filter_1.txt
+      - @LISTS@/filter_24.txt
+      - @LISTS@/filter_27.txt
+      - @LISTS@/filter_51.txt
+  clientGroupsBlock:
+    default:
+      - shared
+  loading:
+    downloads:
+      timeout: 120s

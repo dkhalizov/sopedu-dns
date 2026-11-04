@@ -1,0 +1,104 @@
+# sopedu-dns example configuration for a home LAN.
+#
+#   cp config.example.toml config.local.toml
+#   sopedu-dns --check config.local.toml     # validate, no sockets opened
+#   sopedu-dns config.local.toml
+#
+# Every key is optional. The values below are the defaults unless the comment
+# says otherwise. Put plain keys before the [tables]: a key after a [table]
+# header belongs to that table.
+
+# DNS address and port, UDP and TCP. Default 0.0.0.0:53, which needs root or
+# CAP_NET_BIND_SERVICE. As a normal user, pick a high port and test with
+# `dig @127.0.0.1 -p 15353 example.com`. On macOS avoid 5353 (mDNS uses it).
+listen = "127.0.0.1:15353"
+# Dual-stack LAN: an array opens UDP and TCP sockets for each address.
+# IPv6 sockets are IPV6_V6ONLY, so "[::]:53" does not take IPv4 and can sit
+# next to an IPv4 address. Example: systemd-resolved holds 127.0.0.53:53,
+# which makes a dual-stack "[::]:53" fail. 1 to 16 addresses, no duplicates.
+# Changing the list needs a restart.
+# listen = ["192.168.1.11:53", "[2001:db8::11]:53"]
+
+# Web UI, /healthz and /metrics. Read-only with no login: keep it on loopback
+# or set ui_enabled = false. Answers only when the Host header is an IP
+# address or "localhost" (http://127.0.0.1:9999/ works, http://myhost:9999/
+# does not).
+ui_enabled = true
+ui_listen = "127.0.0.1:9999"
+
+# DNS-over-HTTPS upstreams, raced against each other. https:// URLs only.
+# An IP address in the URL needs no bootstrap DNS lookup.
+upstreams = ["https://1.1.1.1/dns-query", "https://1.0.0.1/dns-query", "https://8.8.8.8/dns-query"]
+# How misses pick an upstream. "fastest" (default) spreads them by latency
+# and hedges slow answers. "ordered" sends every query to the first healthy
+# upstream above and uses the rest as backup.
+# upstream_strategy = "fastest"
+# Plain DNS servers, used only when every DoH upstream fails at the transport
+# level (no connection or no TLS session). An HTTP error status, a reset or an
+# invalid reply does not count. Off by default: plain DNS is unauthenticated,
+# and an attacker who can block port 443 could force the downgrade and forge
+# answers. Each use is counted in dns_plain_fallback_answers_total and logged
+# as plaintext_fallback_used, at most once a minute.
+# fallback = ["1.1.1.1:53", "8.8.8.8:53"]
+
+# Who may query, as CIDR. Everyone else gets REFUSED. Default: loopback,
+# RFC 1918, link-local and fc00::/7, as below. Add your IPv6 LAN prefix if
+# clients use global IPv6 addresses; a refused source inside this host's own
+# global prefix is logged once as client_refused_onlink. 100.64.0.0/10
+# (RFC 6598 shared space) is left out because behind a carrier-grade NAT it
+# belongs to other subscribers. Add it only for an overlay such as Tailscale.
+# allowed_clients = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+#                    "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10"]
+
+# Blocklists: hosts files or adblock-style lists, http:// or https://.
+# Default none, so nothing is blocked until you add one. Copies are cached in
+# state_dir and refreshed every refresh_hours.
+blocklists = [
+  "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt",
+]
+refresh_hours = 24
+
+# Extra rules in list syntax. "||ads.example^" blocks a name and its
+# subdomains. "@@||ok.example^$important" allows it even if a list blocks it.
+# The UI's /rules page gives you candidates to paste.
+user_rules = [
+  # "@@||example.org^$important",
+]
+
+# Clients that skip the blocklists. They still use the cache and upstreams.
+no_filter_clients = []
+# no_filter_macs = ["aa:bb:cc:dd:ee:ff"]    # Linux only, IPv4 neighbours
+
+# Response cache. cache_size = 0 turns it off.
+# An expired answer is refreshed first. If the refresh takes longer than
+# serve_stale_client_timeout_ms (1.8 s, the RFC 8767 value), the expired copy
+# answers while the refresh continues, up to optimistic_max_age past expiry.
+# serve_stale_client_timeout_ms = 0 answers from expired data at once, like
+# AdGuard Home's optimistic cache; that is not RFC 8767 conformant.
+# prefetch refreshes names that are still being asked before they expire.
+cache_size = 10000
+optimistic_max_age = "12h"
+# serve_stale_client_timeout_ms = 1800
+# prefetch = true
+
+# Holds the cached blocklists, the pre-warm list and the dashboard stats
+# snapshot. The pre-warm list (your busiest names) and the stats snapshot
+# (counters, top domains, top blocked, top clients, latency histograms) are
+# browsing history and are written mode 0600. prewarm = false and
+# persist_stats = false delete them at startup and write nothing. A relative
+# path is relative to the directory you start the server from; a service
+# should use an absolute path.
+state_dir = "state"
+prewarm = true
+persist_stats = true
+
+# One line per query on stdout. Off by default; the UI's /log works without it.
+log_queries = false
+
+# Local names: exact names and "*.suffix" wildcards. The most specific wins.
+# [rewrites]
+# "nas.lan" = "192.168.1.10"
+
+# Names for the UI's /clients page, keyed by client IP.
+# [client_names]
+# "192.168.1.20" = "living-room tv"

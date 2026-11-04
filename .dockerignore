@@ -1,0 +1,20 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!src/**
+# Declared `[[bench]]` targets must exist for cargo to parse the manifest;
+# they are not compiled by `cargo build`.
+!benches
+!benches/**
+# The `test` stage runs the suite; the `bench-build` stage builds dns_mock.
+# Everything else under `bench/` stays excluded.
+!tests
+!tests/**
+!examples
+!examples/**
+!config.example.toml
+!deploy
+!deploy/**
+!dist
+!dist/**

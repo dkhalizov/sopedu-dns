@@ -1,0 +1,37 @@
+# Shared upstream (plain 5300, DoH 8443) and list server (8080) for every
+# server under test. Runs on UPSTREAM_NODE_NAME with host networking.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-upstream
+spec:
+  nodeName: UPSTREAM_NODE_NAME
+  hostNetwork: true
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 2
+  containers:
+    - name: upstream
+      image: upstream-mock:bench
+      imagePullPolicy: Never
+      args: ["--listen", "0.0.0.0:5300", "--doh", "0.0.0.0:8443", "--cert", "/tls/cert.der",
+             "--key", "/tls/key.der", "--delay-ms", "UPSTREAM_DELAY_MS"]
+      volumeMounts:
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+    - name: lists
+      image: python:3.14-alpine
+      command: ["python", "-m", "http.server", "8080", "-d", "/lists"]
+      volumeMounts:
+        - name: lists
+          mountPath: /lists
+          readOnly: true
+  volumes:
+    - name: tls
+      hostPath:
+        path: /tmp/sopedu-bench/tls
+        type: Directory
+    - name: lists
+      hostPath:
+        path: /tmp/sopedu-bench/lists
+        type: Directory
