@@ -72,6 +72,7 @@ blocklists loaded.
 |---|---|---|---|
 | **sopedu-dns 1.0.0** | 94.1k (64.2-106.7k) | 1.3 ms | 18.9 MiB |
 | Unbound 1.26.2 ¹ | 64.6k (49.9-77.4k) | 1.7 ms | 26.2 MiB |
+| Numa 0.25.0 ⁴ | 45.3k (45.2-45.3k) | 1.0 ms | 84.0 MiB |
 | dnsmasq 2.91 ¹ | 27.5k (25.3-27.5k) | 13.8 ms | 10.2 MiB |
 | Blocky v0.35.0 | 16.4k (16.4-16.4k) | 3.6 ms | 87.2 MiB |
 | Pi-hole 2026.10.1 | 4.1k (3.6-4.1k) | 120.8 ms ² | 234.1 MiB |
@@ -80,11 +81,18 @@ blocklists loaded.
 ¹ No blocklists loaded: plain forwarders, here as a reference.
 ² Dropped queries at this rate: 8,711 (Pi-hole) and 690 (AdGuard Home) of 75,000.
 ³ 6.7k qps in the first run, then nothing; it reached its 512 MiB limit.
+⁴ Separate run on the same setup, back to back with sopedu-dns, which did
+107.5k (103.1-107.8k), 1.9 ms and 18.5 MiB there. Both latency figures are
+medians of 10 passes. Numa's memory peaked while loading the lists, and it
+held 55.6 MiB at the end.
 
 Where it doesn't win: over TCP, Unbound did 57.8k qps to our 54.5k. At
 50 qps, AdGuard Home's p99 was one histogram bucket lower (1.15 vs 1.9 ms).
-dnsmasq uses less memory. Inside the process a cache hit takes at most 8 µs
-at p99; the rest of the cache-hit latency in the table is network time.
+dnsmasq uses less memory. Numa had the better p99 for cache hits at 5k qps
+(1.0 vs 1.9 ms over 10 passes, with overlapping ranges) and for misses (15.9
+vs 18.9 ms, one pass), and TCP was a tie (62.8k vs 63.2k qps, one run each).
+Inside the process a cache hit takes at most 8 µs at p99;
+the rest of the cache-hit latency in the table is network time.
 
 Test setup: a two-node k3s cluster. The server Pod got 1 CPU and 512 MiB on an Intel i5-9400T (Linux 6.8), dnsperf 2.14 ran on the other
 node, and both nodes kept their usual workloads. Every server got the same
@@ -107,16 +115,19 @@ We wrote a conformance harness straight from the RFCs and ran it against
 sopedu-dns and four popular servers, all set up as plain forwarders. These
 are the MUST and MUST NOT checks every server could be tested on:
 
-| Server | Passed |
-|---|---|
-| **sopedu-dns 1.0.0** | 181 / 181 |
-| Unbound 1.26.2 | 178 / 181 |
-| AdGuard Home v0.107.80 | 177 / 181 |
-| dnsmasq 2.91 | 173 / 181 |
-| Pi-hole (FTL v6.8) | 170 / 181 |
+| Server | All six servers | Without Numa |
+|---|---|---|
+| **sopedu-dns 1.0.0** | 139 / 139 | 181 / 181 |
+| Unbound 1.26.2 | 136 / 139 | 178 / 181 |
+| AdGuard Home v0.107.80 | 135 / 139 | 177 / 181 |
+| dnsmasq 2.91 | 131 / 139 | 173 / 181 |
+| Numa 0.25.0 | 130 / 139 | not comparable |
+| Pi-hole (FTL v6.8) | 128 / 139 | 170 / 181 |
 
-The misses are EDNS corner cases (BADVERS, malformed OPT records) and, for
-dnsmasq and Pi-hole, no failure caching. None of it breaks normal browsing.
+Numa has fewer checks because it can't turn its cache off or answer blocked
+names with NXDOMAIN. The misses are EDNS corner cases (BADVERS, malformed OPT
+records), for dnsmasq and Pi-hole no failure caching, and for Numa lowercased
+names inside RRSIG and NSEC records. None of it breaks normal browsing.
 It's our harness and our reading of the RFCs, so treat it as one data
 point. What each server failed, and the RFC list we follow:
 [docs/conformance.md](docs/conformance.md).

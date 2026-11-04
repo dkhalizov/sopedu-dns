@@ -41,7 +41,7 @@ make_inputs() {
     "$LISTS_DIR"/*.txt > "$LOCAL_INPUTS/blocked.txt"
   awk 'NR <= 300 { print $1 }' "$LOCAL_INPUTS/blocked.txt" > "$LOCAL_INPUTS/blocked-sample.txt"
   local n=$(( MISS_RATE * RATE_SECONDS * 2 + 1000 ))
-  for s in sopedu agh pihole blocky unbound dnsmasq; do
+  for s in sopedu agh pihole blocky unbound dnsmasq numa; do
     for t in plain doh; do
       awk -v n="$n" -v p="$s$t" 'BEGIN { for (i = 0; i < n; i++) printf "m%d.%s.miss.bench A\n", i, p }' \
         > "$LOCAL_INPUTS/miss-$s-$t.txt"

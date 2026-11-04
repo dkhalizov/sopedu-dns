@@ -1,0 +1,24 @@
+# Numa's shipped defaults, plain upstream. Its proxy, DoT, mobile API and LAN
+# discovery are off: they are not DNS forwarding and want ports on a shared host.
+[server]
+bind_addr = "0.0.0.0:@PORT@"
+data_dir = "/data"
+
+[upstream]
+mode = "forward"
+address = ["@PLAIN@"]
+
+[blocking]
+lists = ["@LISTS@/filter_1.txt", "@LISTS@/filter_24.txt", "@LISTS@/filter_27.txt", "@LISTS@/filter_51.txt"]
+
+[proxy]
+enabled = false
+
+[dot]
+enabled = false
+
+[mobile]
+enabled = false
+
+[lan]
+enabled = false

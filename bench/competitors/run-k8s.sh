@@ -111,7 +111,7 @@ make_inputs
 for h in "$SSH_HOST" "$UPSTREAM_SSH_HOST" "$CLIENT_SSH_HOST"; do
   ssh "$h" 'sudo mkdir -p /tmp/sopedu-bench && sudo chown -R "$(id -u):$(id -g)" /tmp/sopedu-bench'
 done
-ssh "$SSH_HOST" 'mkdir -p /tmp/sopedu-bench/sopedu /tmp/sopedu-bench/agh /tmp/sopedu-bench/blocky /tmp/sopedu-bench/unbound /tmp/sopedu-bench/dnsmasq'
+ssh "$SSH_HOST" 'mkdir -p /tmp/sopedu-bench/sopedu /tmp/sopedu-bench/agh /tmp/sopedu-bench/blocky /tmp/sopedu-bench/unbound /tmp/sopedu-bench/dnsmasq /tmp/sopedu-bench/numa'
 for h in "$SSH_HOST" "$UPSTREAM_SSH_HOST"; do
   scp -qr "$LOCAL_RUN/tls" "$h:/tmp/sopedu-bench/"
 done
@@ -144,6 +144,7 @@ prepare_node() {
     blocky) sed "${sub[@]}" configs/blocky.yml | ssh "$SSH_HOST" 'cat > /tmp/sopedu-bench/blocky/config.yml' ;;
     unbound) sed "${sub[@]}" -e "s#@PLAINAT@#${PLAIN/:/@}#" configs/unbound.conf | ssh "$SSH_HOST" 'cat > /tmp/sopedu-bench/unbound/unbound.conf' ;;
     dnsmasq) sed "${sub[@]}" -e "s|@PLAINHASH@|${PLAIN/:/#}|" configs/dnsmasq.conf | ssh "$SSH_HOST" 'cat > /tmp/sopedu-bench/dnsmasq/dnsmasq.conf' ;;
+    numa) sed "${sub[@]}" configs/numa.toml | ssh "$SSH_HOST" 'cat > /tmp/sopedu-bench/numa/numa.toml' ;;
     pihole|pihole-lean) : ;;
     *) echo "unknown server: $s" >&2; exit 2 ;;
   esac
@@ -162,7 +163,7 @@ wait_ready() {
 
 for TRANSPORT in $TRANSPORTS; do
   for SERVER in "${servers[@]}"; do
-    if [ "$TRANSPORT" = doh ] && [[ "$SERVER" == pihole* || "$SERVER" == unbound || "$SERVER" == dnsmasq ]]; then
+    if [ "$TRANSPORT" = doh ] && [[ "$SERVER" == pihole* || "$SERVER" == unbound || "$SERVER" == dnsmasq || "$SERVER" == numa ]]; then
       note_row skipped "$SERVER has no DoH upstream client in this harness"
       continue
     fi

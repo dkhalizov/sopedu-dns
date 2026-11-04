@@ -38,6 +38,19 @@ every server could be tested on:
 | dnsmasq | 2.91 | 173 / 181 |
 | Pi-hole (FTL) | v6.8 | 170 / 181 |
 
+We added Numa 0.25.0 later the same day, with the same harness checks and spec.
+Numa can't turn its cache off or answer blocked names with NXDOMAIN, so those
+sessions are blocked for it, and 139 checks are left that all six servers ran:
+
+| Server | Version | MUST checks passed, all six servers |
+|---|---|---|
+| sopedu-dns | 1.0.0 | 139 / 139 |
+| Unbound | 1.26.2 | 136 / 139 |
+| AdGuard Home | v0.107.80 | 135 / 139 |
+| dnsmasq | 2.91 | 131 / 139 |
+| Numa | 0.25.0 | 130 / 139 |
+| Pi-hole (FTL) | v6.8 | 128 / 139 |
+
 In the same run sopedu-dns passed all 259 MUST checks and all 35 SHOULD
 checks the harness could run against it.
 
@@ -53,6 +66,10 @@ What the others failed:
   with SERVFAIL goes upstream again (RFC 9520 §3.2).
 - Pi-hole has the dnsmasq failures, and it sends a 513-octet answer without
   TC to a client that advertised a UDP size below 512 (RFC 6891 §6.2.3).
+- Numa answers NOERROR instead of BADVERS to EDNS versions 1, 2 and 255
+  (RFC 6891 §6.1.3), and NOERROR instead of FORMERR to malformed OPT records
+  (§6.1.2, §7). It also lowercases the names inside RRSIG and NSEC records
+  (RFC 3597 §3).
 
 None of these break normal browsing. They show up with unusual or broken
 clients, and the missing failure cache adds upstream load when a domain is
@@ -60,6 +77,10 @@ broken.
 
 ## Limits of this comparison
 
+- Numa lowercases the question in its replies. No counted MUST covers that, but
+  the harness stops an exchange there, which hid later checks. Its row comes
+  from a second run that skipped only that assertion, and a failure in either
+  run counts against it.
 - We wrote the harness from our own spec, and it isn't public yet. A check
   counts only where the RFC text makes the behaviour a MUST for a forwarder,
   but it's still our reading of the RFCs.

@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-numa
+spec:
+  nodeName: NODE_NAME
+  hostNetwork: true
+  dnsPolicy: ClusterFirstWithHostNet
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: numa
+      image: ghcr.io/razvandimescu/numa:0.25.0@sha256:836546ce39f7225cbf4d1cb4fd63ca6b17792825322d624e1eb6ee3fb9f29d5b
+      args: ["-c", "/config/numa.toml"]
+      resources:
+        requests:
+          cpu: "1"
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: config
+      hostPath:
+        path: /tmp/sopedu-bench/numa
+        type: Directory
+    - name: data
+      emptyDir: {}
