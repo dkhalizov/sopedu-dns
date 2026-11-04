@@ -34,6 +34,10 @@ It runs on a Raspberry Pi, a mini PC, a Docker host or a small Kubernetes
 cluster. It's written in Rust, has no database, and needs root only to bind
 port 53.
 
+The name comes from Sopedu (also spelled Sopdu), the ancient Egyptian god of
+the sky and the eastern borders, who protected Egypt's frontier outposts. Your
+home network is a smaller frontier, but the job is similar.
+
 ![Dashboard with live queries, upstream health and blocklists](docs/images/dashboard.png)
 
 ## Features
