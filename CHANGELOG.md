@@ -6,6 +6,11 @@ release on we follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The benchmark docs counted duplicates: the four lists hold 744k entries and
+  516k unique rules. The measurements are unchanged.
+
 ## [1.0.0] - 2026-11-04
 
 First public release.

@@ -24,7 +24,7 @@ Cache sizes are each product's default (sopedu 20k entries / 8 MiB, AGH
 | `ready`, `lists` | none | time to first answer; seconds until ≥50% of a 300-rule sample is blocked, and the final blocked share (shows the lists are loaded) |
 | `cold-corpus` | open loop `-Q 500`, private time-ordered corpus from line 1, empty cache | first-time misses mixed with repeats |
 | `miss` | open loop `-Q 200`, never-cached synthetic names | miss path; subtract `UPSTREAM_DELAY_MS` for server overhead |
-| `blocked` | open loop `-Q 500`, 5,000 list rules | blocked answer with ~744k rules loaded |
+| `blocked` | open loop `-Q 500`, 5,000 list rules | blocked answer with the four lists loaded (~516k unique rules) |
 | `hit-50/500/5000` | open loop `-Q`, every distinct corpus name, primed | hit latency at home, busy and stress rates |
 | `sat-udp-N`, `sat-tcp` | closed loop, `OUTSTANDING` in flight, whole corpus | saturation qps. The shared lists block about 29% of the corpus, so this is cache hits plus rule blocks |
 | `sat-allowed-N` | same, only corpus names the lists do not block (`hot-allowed.txt`, derived once from sopedu's NXDOMAINs) | pure cache hits; the stream to compare the unfiltered reference servers on |

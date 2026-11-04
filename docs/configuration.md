@@ -1275,7 +1275,7 @@ Measurements:
   at 32.1 MiB RSS loading the real lists in the builder benchmark. The full
   server, with a warm cache and both the old and new snapshots resident during
   a refresh, peaked at 74.1 MiB RSS. Neither number comes from a Linux pod.
-- On Linux (k3s pod, 1 CPU, 744k list rules from the same four lists), the
+- On Linux (k3s pod, 1 CPU, 516k unique list rules from the same four lists), the
   process peak resident set (`VmHWM`) was 18.9 MiB idle and 18.9 MiB after the
   full benchmark matrix ([final-2026-11-04.md](bench/final-2026-11-04.md)).
 

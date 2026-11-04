@@ -14,7 +14,7 @@ A single static binary that blocks ads, forwards the rest over DNS-over-HTTPS an
 <br>
 [![RFC MUSTs](https://img.shields.io/badge/RFC%20MUST%20checks-181%2F181-brightgreen)](docs/conformance.md)
 [![Throughput](https://img.shields.io/badge/UDP-94k%20qps%20on%201%20core-orange)](docs/bench/final-2026-11-04.md)
-[![Memory](https://img.shields.io/badge/RSS-19%20MiB%20with%20744k%20rules-purple)](docs/bench/final-2026-11-04.md)
+[![Memory](https://img.shields.io/badge/RSS-19%20MiB%20with%20516k%20rules-purple)](docs/bench/final-2026-11-04.md)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/dkhalizov/sopedu-dns/badge)](https://scorecard.dev/viewer/?uri=github.com/dkhalizov/sopedu-dns)
 
 </div>
@@ -33,6 +33,8 @@ sees less of it.
 It runs on a Raspberry Pi, a mini PC, a Docker host or a small Kubernetes
 cluster. It's written in Rust, has no database, and needs root only to bind
 port 53.
+
+![Dashboard with live queries, upstream health and blocklists](docs/images/dashboard.png)
 
 ## Features
 
@@ -61,8 +63,8 @@ port 53.
 
 ## How fast?
 
-On one CPU core with 744k blocklist rules loaded, sopedu-dns answered
-94k queries per second. Its slowest run beat Blocky's best by 3.9× and
+On one CPU core with four blocklists loaded (744k entries, 516k unique
+rules), sopedu-dns answered 94k queries per second. Its slowest run beat Blocky's best by 3.9× and
 Pi-hole's best by 15×. Its range overlapped Unbound's, and Unbound had no
 blocklists loaded.
 
@@ -89,7 +91,11 @@ node, and both nodes kept their usual workloads. Every server got the same
 mock upstream (+10 ms) and the blocking ones the same four public lists.
 The query stream is 12,692 real names from a home network, so you can't
 replay it exactly. dnsmasq and Pi-hole don't cache HTTPS records, which are
-24% of that stream, and that explains part of their hit latency. The harness
+24% of that stream, and that explains part of their hit latency. Pi-hole ran
+with its defaults, which log every query, and its CPU quota throttled it in
+18-76% of scheduler periods. With query logging off it was about 3× faster on
+pure cache hits, but FTL then aborted after about 1M queries when `/dev/shm`
+filled up in the Pod, so the table keeps the defaults. The harness
 takes any list of names, so run it on yours and open an issue with the
 numbers.
 Full results: [docs/bench/final-2026-11-04.md](docs/bench/final-2026-11-04.md).
@@ -154,6 +160,42 @@ built-in config has the UI off and no blocklists, so mount your own with `-v "$P
 you publish ports instead of using the host network, read
 [the warning](docs/configuration.md#docker).
 
+### Docker Compose
+
+Save this as `compose.yaml`:
+
+```yaml
+services:
+  sopedu-dns:
+    image: ghcr.io/dkhalizov/sopedu-dns:1.0.0
+    network_mode: host
+    user: "0"
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/etc/sopedu-dns/config.toml:ro
+      - sopedu-state:/var/lib/sopedu-dns
+
+volumes:
+  sopedu-state:
+```
+
+And this as `config.toml` next to it:
+
+```toml
+listen = "0.0.0.0:53"
+state_dir = "/var/lib/sopedu-dns"
+blocklists = ["https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt"]
+ui_enabled = true
+ui_listen = "127.0.0.1:9999"
+```
+
+Run `docker compose up -d`, and `dig @127.0.0.1 doubleclick.net` should answer
+NXDOMAIN. Keep that `state_dir`: the root filesystem is read-only, so cached
+lists can only be written to the volume.
+
 ### Kubernetes
 
 ```sh
@@ -204,6 +246,8 @@ health, top domains), query log with live tail, rule tester, clients. It's
 read-only on purpose: the config file is the source of truth, and the rule
 pages give you lines to paste into it.
 
+![Rule tester showing which list and line blocked doubleclick.net](docs/images/rule-tester.png)
+
 There is no login, so keep it on loopback. Reach it with
 `ssh -L 9999:127.0.0.1:9999 <host>` or
 `kubectl port-forward deployment/sopedu-dns 9999:9999`. It rejects requests
@@ -223,6 +267,14 @@ bind it anywhere but loopback.
   per-client policy is a filtering bypass by IP or MAC.
 - No zone transfers, dynamic updates, TSIG or SIG(0). Those requests are
   refused.
+
+## How this was built
+
+AI coding agents wrote all of the code. I chose the design, reviewed the
+changes and decided how to check the result: the RFC conformance harness
+above, fuzzing of the parsers, property tests, the benchmarks above, and
+review passes by separate model instances that saw only the code and the
+RFCs. It has been my home DNS since 3 November 2026.
 
 ## Docs
 
