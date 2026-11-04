@@ -59,7 +59,7 @@ jobs:
           "$bin" --version
       - name: Third-party licence notices
         run: |
-          cargo install cargo-about --locked --version 0.9.3
+          cargo install cargo-about --locked --version 0.9.3 --features cli
           cargo about generate --locked --fail about.hbs > THIRD-PARTY-LICENSES.html
           test -s THIRD-PARTY-LICENSES.html
       - name: Package
