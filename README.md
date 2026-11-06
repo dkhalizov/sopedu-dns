@@ -6,6 +6,8 @@ Network-wide ad blocking that follows the DNS RFCs.
 
 A single static binary that blocks ads, forwards the rest over DNS-over-HTTPS and uses about 20 MiB of RAM.
 
+Project page: [khalizov.com/sopedu](https://khalizov.com/sopedu/)
+
 [![CI](https://github.com/dkhalizov/sopedu-dns/actions/workflows/ci.yml/badge.svg)](https://github.com/dkhalizov/sopedu-dns/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/dkhalizov/sopedu-dns)](https://github.com/dkhalizov/sopedu-dns/releases)
 [![Container](https://img.shields.io/badge/ghcr.io-sopedu--dns-2496ED?logo=docker&logoColor=white)](https://github.com/dkhalizov/sopedu-dns/pkgs/container/sopedu-dns)
