@@ -33,7 +33,7 @@ use foldhash::fast::RandomState;
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt::Write,
     future::Future,
     net::{IpAddr, Ipv6Addr},
@@ -339,15 +339,17 @@ pub struct Top {
 /// Space-Saving heavy hitters (Metwally et al.) with a fixed number of
 /// counters. A key already tracked is incremented; otherwise it evicts the
 /// smallest counter and inherits its count as error.
-/// Known limit: the minimum is a linear scan over k counters (100 for the top
-/// lists, `prewarm_count` <= 10000 for the pre-warm list), fine for the drain
-/// task; a stream-summary list would be needed to go past that.
+/// `order` keeps (count, slot) sorted, so finding the smallest counter is
+/// O(log k) instead of a scan over all k (`prewarm_count` is up to 10000, and
+/// with a large working set nearly every add evicts). The drain runs on the
+/// runtime thread, so a scan there delayed cache hits.
 /// The index keys are client-chosen names, so the hasher must be seeded
 /// per process (foldhash's `RandomState` is), not a fixed one.
 pub struct SpaceSaving {
     cap: usize,
     items: Vec<Top>,
     index: HashMap<Box<[u8]>, usize, RandomState>,
+    order: BTreeSet<(u64, usize)>,
 }
 
 impl SpaceSaving {
@@ -356,20 +358,26 @@ impl SpaceSaving {
             cap,
             items: Vec::with_capacity(cap),
             index: HashMap::with_capacity_and_hasher(cap, RandomState::default()),
+            order: BTreeSet::new(),
         }
     }
 
     pub fn add(&mut self, key: &[u8]) {
         if let Some(&i) = self.index.get(key) {
-            self.items[i].count += 1;
+            let count = &mut self.items[i].count;
+            self.order.remove(&(*count, i));
+            *count += 1;
+            self.order.insert((*count, i));
         } else if self.items.len() < self.cap {
-            self.index.insert(key.into(), self.items.len());
+            let i = self.items.len();
+            self.index.insert(key.into(), i);
             self.items.push(Top { key: key.into(), count: 1, err: 0 });
-        } else if let Some((i, min)) = self.items.iter().enumerate().min_by_key(|(_, t)| t.count) {
-            let min = min.count;
+            self.order.insert((1, i));
+        } else if let Some((min, i)) = self.order.pop_first() {
             self.index.remove(&self.items[i].key);
             self.items[i] = Top { key: key.into(), count: min + 1, err: min };
             self.index.insert(key.into(), i);
+            self.order.insert((min + 1, i));
         }
     }
 
@@ -378,9 +386,11 @@ impl SpaceSaving {
     pub fn restore(&mut self, items: Vec<Top>) {
         self.items.clear();
         self.index.clear();
+        self.order.clear();
         for item in items.into_iter().take(self.cap) {
             if !self.index.contains_key(&item.key) {
                 self.index.insert(item.key.clone(), self.items.len());
+                self.order.insert((item.count, self.items.len()));
                 self.items.push(item);
             }
         }
@@ -740,6 +750,12 @@ impl QueryLog {
     /// Appends the entries written since `cursor` (shard by shard, not time
     /// ordered) and returns how many were overwritten before being read.
     pub fn read_new(&self, cursor: &mut Cursor, out: &mut Vec<Entry>) -> u64 {
+        self.read_new_up_to(cursor, out, usize::MAX)
+    }
+
+    /// [`QueryLog::read_new`] that stops once `out` holds `limit` entries;
+    /// the cursor keeps the rest for the next call.
+    fn read_new_up_to(&self, cursor: &mut Cursor, out: &mut Vec<Entry>, limit: usize) -> u64 {
         let mut lost = 0;
         let per = u64::from(self.per);
         for (shard, at) in self.shards.iter().zip(&mut cursor.0) {
@@ -748,7 +764,7 @@ impl QueryLog {
                 lost += head - *at - per;
                 *at = head - per;
             }
-            while *at < head {
+            while *at < head && out.len() < limit {
                 match self.read(shard, *at) {
                     Read::Entry(e) => out.push(e),
                     Read::NotReady => break,
@@ -781,12 +797,18 @@ impl QueryLog {
 
     /// Moves the entries written since the last drain into the sketches.
     fn feed(&self, d: &mut Drain) {
+        while self.feed_up_to(d, usize::MAX) {}
+    }
+
+    /// Feeds at most `limit` new entries; true when more may be waiting.
+    fn feed_up_to(&self, d: &mut Drain, limit: usize) -> bool {
         let mut entries = Vec::new();
-        d.lost += self.read_new(&mut d.cursor, &mut entries);
+        d.lost += self.read_new_up_to(&mut d.cursor, &mut entries, limit);
         d.seen += entries.len() as u64;
         for e in &entries {
             d.tops.add(e);
         }
+        entries.len() == limit
     }
 
     /// Sizes the pre-warm tracker (0 tracks nothing). Call once at startup.
@@ -919,16 +941,27 @@ pub fn record(started: Instant, latency: Duration, q: &Record<'_>) {
     }
 }
 
+/// Entries fed per drain step before the drain yields to the runtime.
+const DRAIN_CHUNK: usize = 128;
+
 /// Runs the drain forever; spawn once after [`init`].
+///
+/// A tick has every entry of the last half second to feed: about 2,500 at
+/// 5k qps. Fed in one go, that kept the single worker of a 1-CPU deployment
+/// busy for a millisecond or more, and the cache hits waiting behind it set
+/// the p99.9. So it feeds [`DRAIN_CHUNK`] entries at a time (the lock is
+/// released in between) and yields, letting the UDP loop run between chunks.
 pub fn spawn_drain() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Some(log) = LOG.get() {
-                log.tick(Instant::now(), &stats::global().snapshot());
+            let Some(log) = LOG.get() else { continue };
+            while log.feed_up_to(&mut log.state(), DRAIN_CHUNK) {
+                tokio::task::yield_now().await;
             }
+            log.tick(Instant::now(), &stats::global().snapshot());
         }
     })
 }
@@ -1101,6 +1134,66 @@ mod tests {
     }
 
     #[test]
+    fn drain_feeds_in_chunks_and_keeps_the_rest() {
+        let log = QueryLog::with_shards(1024, 2);
+        let name = wire_name("x.test");
+        let t0 = Instant::now();
+        for _ in 0..300 {
+            log.write(t0, Duration::ZERO, &rec("10.0.0.1", &name, Outcome::Cache));
+        }
+        let mut d = log.state();
+        assert!(log.feed_up_to(&mut d, 128), "a full chunk says more may wait");
+        assert_eq!(d.seen, 128);
+        assert!(log.feed_up_to(&mut d, 128));
+        assert!(!log.feed_up_to(&mut d, 128), "44 left: the last chunk is short");
+        assert_eq!((d.seen, d.lost), (300, 0), "every entry fed once, none skipped");
+        assert_eq!(d.tops.domains.top(1)[0].count, 300);
+    }
+
+    /// Measurement only: `cargo test --release drain_chunk_cost -- --ignored --nocapture`.
+    /// One tick's worth at 5k qps (2,500 entries over 12,700 distinct names,
+    /// pre-warm tracker at its default 1,000) fed in DRAIN_CHUNK steps.
+    #[test]
+    #[ignore]
+    fn drain_chunk_cost() {
+        let log = QueryLog::new(10_000);
+        log.track_names(1000);
+        let t0 = Instant::now();
+        let names: Vec<Vec<u8>> = (0..12_700).map(|i| wire_name(&format!("host{i}.example{}.com", i % 97))).collect();
+        let mut worst = Duration::ZERO;
+        let mut total = Duration::ZERO;
+        let mut chunks = 0u32;
+        let mut tick_worst = Duration::ZERO;
+        for tick in 0..40usize {
+            for i in 0..2500usize {
+                let n = &names[(tick * 2500 + i * 7) % names.len()];
+                let outcome = if i % 10 < 3 { Outcome::Blocked } else { Outcome::Cache };
+                log.write(t0, Duration::ZERO, &Record { qtype: 1, ..rec("10.0.0.2", n, outcome) });
+            }
+            loop {
+                let started = std::time::Instant::now();
+                let more = log.feed_up_to(&mut log.state(), DRAIN_CHUNK);
+                let took = started.elapsed();
+                worst = worst.max(took);
+                total += took;
+                chunks += 1;
+                if !more {
+                    break;
+                }
+            }
+            let started = std::time::Instant::now();
+            log.tick(Instant::now(), &stats::global().snapshot());
+            tick_worst = tick_worst.max(started.elapsed());
+        }
+        eprintln!(
+            "chunks {chunks}, mean {:?}, worst {:?}, per entry {:?}, tick tail worst {tick_worst:?}",
+            total / chunks,
+            worst,
+            total / (40 * 2500)
+        );
+    }
+
+    #[test]
     fn disabled_log_writes_nothing() {
         let log = QueryLog::new(0);
         assert!(!log.enabled());
@@ -1213,6 +1306,9 @@ mod tests {
         }
         assert_eq!(ss.items.len(), 10);
         assert_eq!(ss.index.len(), 10);
+        // The ordered index mirrors the counters exactly, so its first entry is the true minimum.
+        let mirrored: BTreeSet<_> = ss.items.iter().enumerate().map(|(i, t)| (t.count, i)).collect();
+        assert_eq!(ss.order, mirrored);
         let top = ss.top(2);
         let keys: Vec<_> = top.iter().map(|t| u32::from_be_bytes(t.key[..].try_into().unwrap())).collect();
         assert!(keys.contains(&1_000_000) && keys.contains(&2_000_000), "{keys:?}");

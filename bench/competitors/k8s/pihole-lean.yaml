@@ -47,6 +47,13 @@ spec:
       volumeMounts:
         - name: etc
           mountPath: /etc/pihole
+        # FTL keeps every query in /dev/shm even with logging off; the
+        # runtime's 64 MiB default fills after about 1M queries and FTL exits.
+        # Memory-backed, so it counts against the 512 MiB limit.
+        - name: shm
+          mountPath: /dev/shm
   volumes:
     - name: etc
       emptyDir: {}
+    - name: shm
+      emptyDir: {medium: Memory, sizeLimit: 256Mi}

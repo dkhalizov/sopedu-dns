@@ -382,9 +382,9 @@ struct LargeTxtUdpMock {
 }
 
 impl LargeTxtUdpMock {
-    /// 12 character-strings of 200 bytes: 2400 bytes of RDATA, above
-    /// 2048 bytes and below the 4096-byte UDP cap.
-    const STRINGS: usize = 12;
+    /// 6 character-strings of 200 bytes: 1200 bytes of RDATA, above
+    /// 1024 bytes and below the 1400-byte UDP cap (RFC 9715 section 3.1).
+    const STRINGS: usize = 6;
     const STRING_LEN: usize = 200;
 
     fn answer(question: &Message) -> Message {
@@ -1311,14 +1311,14 @@ fn udp_batch_answers_warm_hits_over_udp() {
 }
 
 /// Large inline replies are not lost on the send path. A warm hit whose
-/// answer exceeds 2048 bytes is still delivered over UDP,
+/// answer exceeds 1024 bytes is still delivered over UDP,
 /// with the client ID restored and no upstream query.
 #[test]
 fn udp_batch_delivers_a_large_inline_hit() {
     let addr = free_addr();
     let dir = temp_dir("udp-batch-large");
     let upstream = LargeTxtUdpMock::start();
-    let text = config(addr, &dir, &[upstream.addr], "udp_batch = 4\nudp_max_payload = 4096\ncache_size = 1000");
+    let text = config(addr, &dir, &[upstream.addr], "udp_batch = 4\nudp_max_payload = 1400\ncache_size = 1000");
     let mut server = Running::start(&dir, &text);
     server.wait_ready();
 
@@ -1343,7 +1343,7 @@ fn udp_batch_delivers_a_large_inline_hit() {
 
     let cold = udp_exchange(addr, &request(1), Duration::from_secs(5)).expect("cold answer");
     assert_eq!(cold.metadata.id, 1);
-    assert!(!cold.metadata.truncation, "the answer fits the configured 4096-byte cap");
+    assert!(!cold.metadata.truncation, "the answer fits the configured 1400-byte cap");
     assert_eq!(txt_len(&cold), expected);
     assert_eq!(upstream.queries.load(Ordering::Relaxed), 1);
 
@@ -1352,7 +1352,7 @@ fn udp_batch_delivers_a_large_inline_hit() {
     assert_eq!(warm.metadata.response_code, ResponseCode::NoError);
     assert!(!warm.metadata.truncation, "a warm inline answer is not truncated");
     assert_eq!(txt_len(&warm), expected, "the full large answer arrives");
-    assert!(warm.to_vec().unwrap().len() > 2048, "the reply is larger than the removed send batch");
+    assert!(warm.to_vec().unwrap().len() > 1024, "the reply is larger than a single receive buffer");
     assert_eq!(upstream.queries.load(Ordering::Relaxed), 1, "the warm hit is answered inline");
 }
 
@@ -1633,10 +1633,16 @@ fn a_second_signal_aborts_the_drain() {
 fn check_validates_without_binding_downloading_or_creating_state() {
     let http = HttpMock::start("||listed.test^\n");
     let dir = temp_dir("check");
-    // Occupy the listen address: a check that bound sockets would fail.
-    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Occupy the listen address: a check that bound sockets would fail. The
+    // port must be free for both protocols; another test may hold its TCP twin.
+    let (udp, tcp) = (0..20)
+        .find_map(|_| {
+            let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
+            let tcp = TcpListener::bind(udp.local_addr().ok()?).ok()?;
+            Some((udp, tcp))
+        })
+        .expect("a port free for both UDP and TCP");
     let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).unwrap();
     let path = dir.join("config.toml");
     let blocklist = format!("http://user:pass@{}/list.txt?token=secret", http.addr);
     fs::write(&path, config(addr, &dir, &[], &format!("blocklists = [\"{blocklist}\"]\nlog_queries = true"))).unwrap();
@@ -2657,6 +2663,32 @@ fn healthz_is_unready_while_no_blocklist_has_loaded() {
     assert!(!metrics.contains("dns_blocklist_last_success_timestamp{"));
 }
 
+/// `/metrics` reports the bounds the server enforces: work in flight upstream
+/// and on the UDP slow path, and a list stopped by `blocklist_max_bytes`
+/// while streaming, with the parse buffer kept within that bound.
+#[test]
+fn metrics_report_inflight_work_and_streaming_list_bounds() {
+    let addr = free_addr();
+    let ui = free_tcp_addr();
+    let dir = temp_dir("ui-metrics-bounds");
+    let body: &'static str = Box::leak("||large.test^\n".repeat(1000).into_boxed_str());
+    let lists = HttpMock::start(body);
+    let text = format!(
+        "listen = \"{addr}\"\nstate_dir = \"{}\"\nupstreams = []\nfallback = []\nui_listen = \"{ui}\"\n\
+         blocklists = [\"http://{}/list.txt\"]\nblocklist_max_bytes = 1024\n",
+        dir.join("state").display(),
+        lists.addr
+    );
+    let mut server = Running::start(&dir, &text);
+    server.wait_ready();
+    let (_, _, metrics) = http(ui, "GET", "/metrics");
+    assert!(metric(&metrics, "dns_blocklist_rejected_oversize_total") >= 1.0, "{metrics}");
+    assert_eq!(metric(&metrics, "dns_blocklist_buffer_limit_bytes"), 1024.0);
+    assert!(metric(&metrics, "dns_blocklist_buffer_peak_bytes") <= 1024.0, "{metrics}");
+    assert_eq!(metric(&metrics, "dns_upstream_inflight"), 0.0, "idle: nothing upstream");
+    assert_eq!(metric(&metrics, "dns_udp_inflight"), 0.0, "idle: no slow-path UDP work");
+}
+
 /// A taken `ui_listen` is a clear startup error, not a silent missing UI.
 #[test]
 fn ui_bind_failure_is_a_startup_error() {
@@ -3160,4 +3192,751 @@ fn doh_upstream_certificates_are_verified_against_ssl_cert_file() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// RFC evidence tests (`cargo test --test ops rfc`). Each drives the real binary.
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+type MockBuild = dyn Fn(&Message) -> Option<Message> + Send + Sync;
+
+/// A plain-DNS upstream whose answers come from a closure: UDP with TC
+/// truncation per the advertised size, and a TCP twin with the full answer.
+/// `None` from the closure means silence.
+struct RfcMock {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<Message>>>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<thread::JoinHandle<()>>,
+}
+
+impl RfcMock {
+    fn start(build: impl Fn(&Message) -> Option<Message> + Send + Sync + 'static) -> Self {
+        let build: Arc<MockBuild> = Arc::new(build);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let addr = socket.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let twin = {
+            let build = build.clone();
+            tcp_twin(addr, stop.clone(), move |question| {
+                build(question)
+                    .unwrap_or_else(|| Message::new(question.metadata.id, MessageType::Response, OpCode::Query))
+            })
+        };
+        let udp = {
+            let (stop, seen) = (stop.clone(), seen.clone());
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok((n, peer)) = socket.recv_from(&mut buf) else { continue };
+                    let Ok(question) = Message::from_vec(&buf[..n]) else { continue };
+                    seen.lock().unwrap().push(question.clone());
+                    if let Some(answer) = build(&question) {
+                        let _ = socket.send_to(&udp_reply(&question, answer), peer);
+                    }
+                }
+            })
+        };
+        Self { addr, seen, stop, threads: vec![udp, twin] }
+    }
+
+    /// UDP queries received so far.
+    fn count(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+}
+
+impl Drop for RfcMock {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A response skeleton for `question`: QR, RA, AA (an authoritative upstream)
+/// and the question echoed.
+fn mock_answer(question: &Message) -> Message {
+    let mut answer = Message::new(question.metadata.id, MessageType::Response, OpCode::Query);
+    answer.metadata.recursion_desired = question.metadata.recursion_desired;
+    answer.metadata.recursion_available = true;
+    answer.metadata.authoritative = true;
+    answer.add_queries(question.queries.iter().cloned());
+    if question.edns.is_some() {
+        answer.edns.get_or_insert_with(Default::default).set_max_payload(1232);
+    }
+    answer
+}
+
+fn record(name: &Name, ttl: u32, data: RData) -> Record {
+    Record::from_rdata(name.clone(), ttl, data)
+}
+
+fn mock_soa(name: &Name) -> Record {
+    record(
+        name,
+        60,
+        RData::SOA(hickory_proto::rr::rdata::SOA::new(name.clone(), name.clone(), 1, 3600, 600, 86400, 60)),
+    )
+}
+
+/// A recursive query for `name`/`rtype`, with an OPT advertising `edns` bytes when given.
+fn typed_query(name: &str, id: u16, rtype: RecordType, edns: Option<u16>) -> Message {
+    let mut message = Message::new(id, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(Name::from_ascii(format!("{name}.")).unwrap(), rtype));
+    if let Some(size) = edns {
+        message.edns.get_or_insert_with(Default::default).set_max_payload(size);
+    }
+    message
+}
+
+fn udp_raw(server: SocketAddr, raw: &[u8], limit: Duration) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(limit)).unwrap();
+    socket.send_to(raw, server).unwrap();
+    let mut buf = vec![0u8; 65_535];
+    let (n, _) = socket.recv_from(&mut buf).ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+fn tcp_receive_raw(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut length = [0u8; 2];
+    stream.read_exact(&mut length)?;
+    let mut raw = vec![0u8; usize::from(u16::from_be_bytes(length))];
+    stream.read_exact(&mut raw)?;
+    Ok(raw)
+}
+
+fn udp_message(server: SocketAddr, message: &Message) -> Message {
+    let raw = udp_raw(server, &message.to_vec().unwrap(), Duration::from_secs(5)).expect("a UDP reply");
+    Message::from_vec(&raw).unwrap()
+}
+
+fn tcp_message(server: SocketAddr, message: &Message) -> Message {
+    let mut stream = tcp_connect(server);
+    tcp_send(&mut stream, &message.to_vec().unwrap()).unwrap();
+    tcp_receive(&mut stream).expect("a TCP reply")
+}
+
+/// The OPT version of a reply; the reply must carry an OPT.
+fn opt_version(message: &Message) -> u8 {
+    message.edns.as_ref().expect("the reply carries an OPT").version()
+}
+
+/// The RFC 1035 s4.2 facts about port 53, proved separately because binding
+/// 53 needs privilege: (1) a configuration that names no `listen` address
+/// loads as port 53, through the same loader the binary uses; (2) a server
+/// bound to any configured port answers both UDP datagrams and TCP
+/// connections there. Together: the service is UDP and TCP, default port 53.
+#[test]
+fn rfc1035_s1779_s1785_s1814_default_port_is_53_and_the_listen_port_serves_udp_and_tcp() {
+    let dir = temp_dir("rfc-port53");
+    let path = dir.join("default.toml");
+    fs::write(&path, format!("state_dir = \"{}\"\nupstreams = []\nui_enabled = false\n", dir.join("state").display()))
+        .unwrap();
+    let loaded = sopedu_dns::config::Config::load(&path).expect("a config without `listen` loads");
+    assert_eq!(loaded.listen.len(), 1, "one default listen address");
+    assert_eq!(loaded.listen[0].port(), 53, "the default listen port is 53 (decimal)");
+    let _ = fs::remove_dir_all(&dir);
+
+    let addr = free_addr();
+    let dir = temp_dir("rfc-port53-serve");
+    let mut server = Running::start(&dir, &config(addr, &dir, &[], "user_rules = [\"||blocked.test^\"]"));
+    server.wait_ready();
+    let udp = udp_message(addr, &typed_query("blocked.test", 0x1779, RecordType::A, None));
+    assert_eq!((udp.metadata.id, udp.metadata.response_code), (0x1779, ResponseCode::NXDomain), "UDP answers");
+    let mut stream = tcp_connect(addr);
+    tcp_send(&mut stream, &query("blocked.test", 0x1814)).unwrap();
+    let tcp = tcp_receive(&mut stream).expect("TCP answers on the same port");
+    assert_eq!((tcp.metadata.id, tcp.metadata.response_code), (0x1814, ResponseCode::NXDomain), "TCP answers");
+}
+
+/// RFC 6891 s6.1.3: every OPT the server writes says VERSION 0, whatever
+/// path built the reply. Covered: a relayed miss, a cache hit, a policy
+/// block, a TC reply (miss and hit), an upstream reply whose OPT claims
+/// version 1 (never relayed as version 1), and the BADVERS reply to a
+/// version-1 client.
+#[test]
+fn rfc6891_s481_every_reply_path_sets_opt_version_zero() {
+    let mock = RfcMock::start(|question| {
+        let name = question.queries[0].name().clone();
+        let mut answer = mock_answer(question);
+        if name.to_ascii() == "bad-version.test." {
+            answer.edns.get_or_insert_with(Default::default).set_version(1);
+        }
+        if question.queries[0].query_type() == RecordType::TXT {
+            let strings = (0..12).map(|_| "a".repeat(200)).collect();
+            answer.add_answer(record(&name, 60, RData::TXT(TXT::new(strings))));
+        } else {
+            answer.add_answer(record(&name, 60, RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))));
+        }
+        Some(answer)
+    });
+    let addr = free_addr();
+    let dir = temp_dir("rfc-opt-version");
+    let extra = "user_rules = [\"||blocked.test^\"]\nupstream_timeout_seconds = 1";
+    let mut server = Running::start(&dir, &config(addr, &dir, &[mock.addr], extra));
+    server.wait_ready();
+
+    let ask = |name: &str, id: u16, rtype: RecordType| udp_message(addr, &typed_query(name, id, rtype, Some(1232)));
+    let miss = ask("relay.test", 1, RecordType::A);
+    assert_eq!(first_a(&miss), Some(Ipv4Addr::new(192, 0, 2, 1)), "relayed answer");
+    assert_eq!(opt_version(&miss), 0, "relayed upstream answer");
+    let before = mock.count();
+    let hit = ask("relay.test", 2, RecordType::A);
+    assert_eq!(mock.count(), before, "the second query is a cache hit");
+    assert_eq!(first_a(&hit), Some(Ipv4Addr::new(192, 0, 2, 1)));
+    assert_eq!(opt_version(&hit), 0, "cache hit");
+    let blocked = ask("blocked.test", 3, RecordType::A);
+    assert_eq!(blocked.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(opt_version(&blocked), 0, "policy block");
+    for (id, label) in [(4, "TC after a miss"), (5, "TC after a cache hit")] {
+        let truncated = ask("big.test", id, RecordType::TXT);
+        assert!(truncated.metadata.truncation, "{label}: 2400 bytes exceed the 1232 cap");
+        assert_eq!(opt_version(&truncated), 0, "{label}");
+    }
+    let hostile = ask("bad-version.test", 6, RecordType::A);
+    assert!(hostile.edns.as_ref().is_none_or(|edns| edns.version() == 0), "an upstream OPT version 1 is not relayed");
+
+    let mut v1 = typed_query("relay.test", 7, RecordType::A, Some(1232));
+    v1.edns.as_mut().unwrap().set_version(1);
+    let badvers = udp_message(addr, &v1);
+    // Extended RCODE 16 is BADVERS; hickory's From<u16> names that value BADSIG.
+    assert_eq!(u16::from(badvers.metadata.response_code), 16, "a version-1 request is BADVERS");
+    assert_eq!(opt_version(&badvers), 0, "the BADVERS reply states the version this server implements");
+}
+
+/// RFC 8085 s3.2: no UDP datagram exceeds the size the server is willing to
+/// send without fragmentation. The server uses the conservative-size
+/// alternative: 512 bytes for a client without EDNS, at most 1232 for an EDNS
+/// client whatever it advertises, with TC=1 exactly when the full answer (read
+/// over TCP) does not fit. Covered: an upstream miss and a cache hit, a large
+/// uncacheable answer, NXDOMAIN, a policy block and a local rewrite.
+#[test]
+fn rfc8085_s1057_s1059_udp_replies_stay_within_the_conservative_cap() {
+    let mock = RfcMock::start(|question| {
+        let name = question.queries[0].name().clone();
+        let mut answer = mock_answer(question);
+        match (name.to_ascii().as_str(), question.queries[0].query_type()) {
+            ("nx.test.", _) => {
+                answer.metadata.response_code = ResponseCode::NXDomain;
+                answer.add_authority(mock_soa(&name));
+            }
+            (_, RecordType::TXT) => {
+                let strings = (0..12).map(|_| "a".repeat(200)).collect();
+                answer.add_answer(record(&name, 60, RData::TXT(TXT::new(strings))));
+            }
+            ("huge.test.", _) => {
+                for index in 1..=100u8 {
+                    answer.add_answer(record(&name, 60, RData::A(A(Ipv4Addr::new(192, 0, 2, index)))));
+                }
+            }
+            ("mid.test.", _) => {
+                for index in 1..=40u8 {
+                    answer.add_answer(record(&name, 60, RData::A(A(Ipv4Addr::new(192, 0, 2, index)))));
+                }
+            }
+            _ => {
+                answer.add_answer(record(&name, 60, RData::A(A(Ipv4Addr::new(192, 0, 2, 1)))));
+            }
+        }
+        Some(answer)
+    });
+    let addr = free_addr();
+    let dir = temp_dir("rfc-udp-cap");
+    let text = config(
+        addr,
+        &dir,
+        &[mock.addr],
+        "user_rules = [\"||blocked.test^\"]\nrewrites = { \"rw.test\" = \"192.0.2.9\" }",
+    );
+    let mut server = Running::start(&dir, &text);
+    server.wait_ready();
+
+    let cases = [
+        ("small.test", RecordType::A),
+        ("mid.test", RecordType::A),
+        ("big.test", RecordType::TXT),
+        ("huge.test", RecordType::A),
+        ("nx.test", RecordType::A),
+        ("rw.test", RecordType::A),
+        ("blocked.test", RecordType::A),
+    ];
+    let mut truncated_seen = 0;
+    let mut whole_seen = 0;
+    let mut id = 100u16;
+    for pass in ["miss", "hit"] {
+        for (name, rtype) in cases {
+            for edns in [None, Some(512), Some(1232), Some(4096), Some(65_535)] {
+                id += 1;
+                let message = typed_query(name, id, rtype, edns);
+                let datagram = udp_raw(addr, &message.to_vec().unwrap(), Duration::from_secs(8))
+                    .unwrap_or_else(|| panic!("{pass} {name} {edns:?}: no UDP reply"));
+                let limit = edns.map_or(512, |size: u16| usize::from(size).clamp(512, 1232));
+                assert!(
+                    datagram.len() <= limit && datagram.len() <= 1232,
+                    "{pass} {name} {edns:?}: a {} byte datagram exceeds {limit}",
+                    datagram.len()
+                );
+                let udp = Message::from_vec(&datagram).unwrap();
+                id += 1;
+                let mut stream = tcp_connect(addr);
+                tcp_send(&mut stream, &typed_query(name, id, rtype, edns).to_vec().unwrap()).unwrap();
+                let full = tcp_receive_raw(&mut stream).unwrap();
+                if full.len() > limit {
+                    assert!(
+                        udp.metadata.truncation,
+                        "{pass} {name} {edns:?}: {} bytes need TC over {limit}",
+                        full.len()
+                    );
+                    truncated_seen += 1;
+                } else {
+                    assert!(
+                        !udp.metadata.truncation,
+                        "{pass} {name} {edns:?}: {} bytes fit and need no TC",
+                        full.len()
+                    );
+                    assert_eq!(udp.answers.len(), Message::from_vec(&full).unwrap().answers.len(), "{pass} {name}");
+                    whole_seen += 1;
+                }
+            }
+        }
+    }
+    assert!(truncated_seen >= 20 && whole_seen >= 20, "both branches ran: {truncated_seen} TC, {whole_seen} whole");
+}
+
+/// A second local IPv4 address besides 127.0.0.1: 127.0.0.2 when loopback has
+/// it (Linux), else the host's routed interface address (found without
+/// sending a packet). Fails, never skips, when neither exists.
+fn second_local_address() -> std::net::IpAddr {
+    if UdpSocket::bind("127.0.0.2:0").is_ok() {
+        return "127.0.0.2".parse().unwrap();
+    }
+    let probe = UdpSocket::bind("0.0.0.0:0").unwrap();
+    probe.connect("192.0.2.1:9").expect("a routed interface address is needed when 127.0.0.2 is not configured");
+    let ip = probe.local_addr().unwrap().ip();
+    assert!(!ip.is_loopback() && !ip.is_unspecified(), "no second local address on this host: {ip}");
+    ip
+}
+
+/// RFC 8085 s5 (the binary, not the helper module): a wildcard listener
+/// answers from the address the request was sent to, with two distinct local
+/// addresses on both the plain and the batched receive path. Unlike
+/// `wildcard_bind_replies_from_the_queried_address` it never passes without
+/// running.
+#[test]
+fn rfc8085_s1837_wildcard_reply_comes_from_the_queried_address_never_skipped() {
+    let second = second_local_address();
+    for batch in [0, 32] {
+        let port = free_addr().port();
+        let dir = temp_dir("rfc-wildcard");
+        let text = config(
+            SocketAddr::from(([0, 0, 0, 0], port)),
+            &dir,
+            &[],
+            &format!("udp_batch = {batch}\nuser_rules = [\"||blocked.test^\"]"),
+        );
+        let mut server = Running::start(&dir, &text);
+        server.wait_ready();
+        for target in [second, "127.0.0.1".parse().unwrap()] {
+            let target = SocketAddr::new(target, port);
+            assert_eq!(reply_source(&target.ip().to_string(), target), Some(target), "udp_batch = {batch}");
+        }
+    }
+}
+
+/// RFC 1034 s3.7.1: a QTYPE matches just that type. One name asked for A,
+/// TXT, MX, AAAA and NS gets five different answers from the upstream, and
+/// the cache (second round, no new upstream traffic) hands each type its own
+/// answer, never another type's.
+#[test]
+fn rfc1034_s915_qtype_matches_only_that_type_through_the_cache() {
+    let types = [RecordType::A, RecordType::TXT, RecordType::MX, RecordType::AAAA, RecordType::NS];
+    let mock = RfcMock::start(|question| {
+        let name = question.queries[0].name().clone();
+        let mut answer = mock_answer(question);
+        let data = match question.queries[0].query_type() {
+            RecordType::A => RData::A(A(Ipv4Addr::new(192, 0, 2, 11))),
+            RecordType::TXT => RData::TXT(TXT::new(vec!["typed".into()])),
+            RecordType::MX => RData::MX(hickory_proto::rr::rdata::MX::new(10, Name::from_ascii("mx.test.").unwrap())),
+            RecordType::AAAA => RData::AAAA(hickory_proto::rr::rdata::AAAA("2001:db8::11".parse().unwrap())),
+            _ => RData::NS(hickory_proto::rr::rdata::NS(Name::from_ascii("ns.test.").unwrap())),
+        };
+        answer.add_answer(record(&name, 300, data));
+        Some(answer)
+    });
+    let addr = free_addr();
+    let dir = temp_dir("rfc-qtype");
+    let mut server = Running::start(&dir, &config(addr, &dir, &[mock.addr], ""));
+    server.wait_ready();
+    for round in ["miss", "hit"] {
+        for (index, rtype) in types.into_iter().enumerate().rev() {
+            let reply = udp_message(addr, &typed_query("multi.test", 200 + index as u16, rtype, None));
+            assert_eq!(reply.answers.len(), 1, "{round} {rtype}: one answer");
+            assert_eq!(reply.answers[0].data.record_type(), rtype, "{round} {rtype}: only that type is returned");
+        }
+        assert_eq!(mock.count(), types.len(), "{round}: one upstream query per type, none for the repeats");
+    }
+}
+
+/// RFC 6762 s22.1: a `.local` name is not sent to global DNS; the server
+/// answers NXDOMAIN at once. Authoritative data for it exists only when the
+/// operator configures it (a rewrite), never by default. Covered: A, AAAA,
+/// TXT, case variants, the bare label and a deep name, over UDP and TCP, with
+/// zero upstream queries; and a configured entry that does answer.
+#[test]
+fn rfc6762_s3122_local_names_get_nxdomain_without_upstream_unless_configured() {
+    let mock = RfcMock::start(|question| {
+        let mut answer = mock_answer(question);
+        answer.add_answer(record(question.queries[0].name(), 60, RData::A(A(Ipv4Addr::new(192, 0, 2, 66)))));
+        Some(answer)
+    });
+    let addr = free_addr();
+    let dir = temp_dir("rfc-local");
+    let mut server = Running::start(&dir, &config(addr, &dir, &[mock.addr], ""));
+    server.wait_ready();
+    let mut id = 300;
+    for name in ["foo.local", "FOO.Local", "a.b.c.local", "local"] {
+        for rtype in [RecordType::A, RecordType::AAAA, RecordType::TXT] {
+            id += 1;
+            for reply in [
+                udp_message(addr, &typed_query(name, id, rtype, None)),
+                tcp_message(addr, &typed_query(name, id, rtype, None)),
+            ] {
+                assert_eq!(reply.metadata.response_code, ResponseCode::NXDomain, "{name} {rtype}");
+                assert!(reply.answers.is_empty(), "{name} {rtype}");
+            }
+        }
+    }
+    assert_eq!(mock.count(), 0, "no .local query reached an upstream");
+
+    let dir = temp_dir("rfc-local-zone");
+    let configured = free_addr();
+    let text = config(configured, &dir, &[mock.addr], "rewrites = { \"printer.local\" = \"192.0.2.77\" }");
+    let mut server = Running::start(&dir, &text);
+    server.wait_ready();
+    let own = udp_message(configured, &typed_query("printer.local", 1, RecordType::A, None));
+    assert_eq!(first_a(&own), Some(Ipv4Addr::new(192, 0, 2, 77)), "an explicit entry answers");
+    let other = udp_message(configured, &typed_query("other.local", 2, RecordType::A, None));
+    assert_eq!(other.metadata.response_code, ResponseCode::NXDomain, "other .local names stay NXDOMAIN");
+    assert_eq!(mock.count(), 0);
+}
+
+/// RFC 1034 s2.3: when updates are unavailable the usual course is to keep
+/// believing old information while continuing efforts to update it. After the
+/// upstream goes silent the expired answer keeps being served; a refresh is
+/// tried once and its failure suppresses repeats; once the suppression window
+/// ends the refresh is tried again, and its answer replaces the stale copy.
+#[test]
+fn rfc1034_s198_stale_data_is_served_while_refresh_efforts_resume() {
+    let up = Arc::new(AtomicBool::new(true));
+    let fresh = Arc::new(AtomicBool::new(false));
+    let mock = RfcMock::start({
+        let (up, fresh) = (up.clone(), fresh.clone());
+        move |question| {
+            if !up.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (ttl, octet) = if fresh.load(Ordering::Relaxed) { (60, 8) } else { (1, 7) };
+            let mut answer = mock_answer(question);
+            answer.add_answer(record(question.queries[0].name(), ttl, RData::A(A(Ipv4Addr::new(192, 0, 2, octet)))));
+            Some(answer)
+        }
+    });
+    let addr = free_addr();
+    let dir = temp_dir("rfc-stale-resume");
+    let extra =
+        "trust_plain_upstreams = true\nprefetch = false\nserve_stale_client_timeout_ms = 0\nupstream_timeout_seconds = 1";
+    let mut server = Running::start(&dir, &config(addr, &dir, &[mock.addr], extra));
+    server.wait_ready();
+    let ask = |id: u16| udp_message(addr, &typed_query("refresh.test", id, RecordType::A, None));
+
+    assert_eq!(first_a(&ask(1)), Some(Ipv4Addr::new(192, 0, 2, 7)));
+    thread::sleep(Duration::from_millis(1500));
+    up.store(false, Ordering::Relaxed);
+    let stale = ask(2);
+    assert_eq!(
+        (first_a(&stale), stale.answers[0].ttl),
+        (Some(Ipv4Addr::new(192, 0, 2, 7)), 30),
+        "old data is believed"
+    );
+    assert!(eventually(Duration::from_secs(5), || mock.count() == 2), "one refresh attempt was made");
+    let attempt = Instant::now();
+    thread::sleep(Duration::from_millis(2000));
+    for id in 3..7 {
+        let answer = ask(id);
+        assert_eq!(
+            first_a(&answer),
+            Some(Ipv4Addr::new(192, 0, 2, 7)),
+            "still the old data while the upstream is down"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(mock.count(), 2, "the failure suppresses repeated refreshes inside its window");
+
+    up.store(true, Ordering::Relaxed);
+    fresh.store(true, Ordering::Relaxed);
+    let mut id = 10;
+    let replaced = eventually(Duration::from_secs(20), || {
+        id += 1;
+        first_a(&ask(id)) == Some(Ipv4Addr::new(192, 0, 2, 8))
+    });
+    assert!(replaced, "refresh efforts resumed after the window and replaced the stale copy ({:?})", attempt.elapsed());
+    assert_eq!(mock.count(), 3, "exactly one more refresh reached the upstream");
+}
+
+/// RFC 8482 s3: outside the ANY exception the responder constructs replies by
+/// the standard algorithms. Forwarded A, AAAA, MX, TXT, CNAME chain, NODATA
+/// and NXDOMAIN, plus local rewrite and local-zone replies, are checked for:
+/// QR set, opcode and ID echoed, RD echoed (both values), question echoed
+/// byte for byte (case kept), AA only on local zones, answers complete and in
+/// upstream order, negative answers carrying their SOA, nothing truncated.
+#[test]
+fn rfc8482_s252_non_any_replies_follow_the_standard_construction() {
+    let mock = RfcMock::start(|question| {
+        let name = question.queries[0].name().clone();
+        let lower = name.to_ascii().to_ascii_lowercase();
+        let mut answer = mock_answer(question);
+        let target = Name::from_ascii("target.test.").unwrap();
+        match (lower.as_str(), question.queries[0].query_type()) {
+            ("nx.test.", _) => {
+                answer.metadata.response_code = ResponseCode::NXDomain;
+                answer.add_authority(mock_soa(&Name::from_ascii("test.").unwrap()));
+            }
+            ("nodata.test.", _) => {
+                answer.add_authority(mock_soa(&Name::from_ascii("test.").unwrap()));
+            }
+            ("alias.test.", _) => {
+                answer.add_answer(record(&name, 60, RData::CNAME(CNAME(target.clone()))));
+                for octet in [2, 1] {
+                    answer.add_answer(record(&target, 60, RData::A(A(Ipv4Addr::new(192, 0, 2, octet)))));
+                }
+            }
+            (_, RecordType::AAAA) => {
+                for last in ["3", "1"] {
+                    let address = format!("2001:db8::{last}").parse().unwrap();
+                    answer.add_answer(record(&name, 60, RData::AAAA(hickory_proto::rr::rdata::AAAA(address))));
+                }
+            }
+            (_, RecordType::MX) => {
+                for (preference, host) in [(20, "b.mx.test."), (10, "a.mx.test.")] {
+                    let host = Name::from_ascii(host).unwrap();
+                    answer.add_answer(record(
+                        &name,
+                        60,
+                        RData::MX(hickory_proto::rr::rdata::MX::new(preference, host)),
+                    ));
+                }
+            }
+            (_, RecordType::TXT) => {
+                for text in ["z", "a"] {
+                    answer.add_answer(record(&name, 60, RData::TXT(TXT::new(vec![text.into()]))));
+                }
+            }
+            _ => {
+                for octet in [30, 10, 20] {
+                    answer.add_answer(record(&name, 60, RData::A(A(Ipv4Addr::new(192, 0, 2, octet)))));
+                }
+            }
+        }
+        Some(answer)
+    });
+    let addr = free_addr();
+    let dir = temp_dir("rfc-standard-construction");
+    let text = config(addr, &dir, &[mock.addr], "rewrites = { \"rw.test\" = \"192.0.2.50\" }");
+    let mut server = Running::start(&dir, &text);
+    server.wait_ready();
+
+    // (name as sent, qtype, forwarded, expected rcode, answer count)
+    let cases = [
+        ("Multi.Test", RecordType::A, true, ResponseCode::NoError, 3),
+        ("multi.test", RecordType::AAAA, true, ResponseCode::NoError, 2),
+        ("mx.test", RecordType::MX, true, ResponseCode::NoError, 2),
+        ("txt.test", RecordType::TXT, true, ResponseCode::NoError, 2),
+        ("alias.test", RecordType::A, true, ResponseCode::NoError, 3),
+        ("nodata.test", RecordType::A, true, ResponseCode::NoError, 0),
+        ("nx.test", RecordType::A, true, ResponseCode::NXDomain, 0),
+        ("rw.test", RecordType::A, false, ResponseCode::NoError, 1),
+        ("rw.test", RecordType::AAAA, false, ResponseCode::NoError, 0),
+        ("10.in-addr.arpa", RecordType::SOA, false, ResponseCode::NoError, 1),
+        ("10.in-addr.arpa", RecordType::MX, false, ResponseCode::NoError, 0),
+        ("9.8.7.10.in-addr.arpa", RecordType::PTR, false, ResponseCode::NXDomain, 0),
+    ];
+    let mut id = 400;
+    for (name, rtype, forwarded, code, count) in cases {
+        for rd in [true, false] {
+            for tcp in [false, true] {
+                id += 1;
+                let mut message = typed_query(name, id, rtype, None);
+                message.metadata.recursion_desired = rd;
+                let label = format!("{name} {rtype} rd={rd} tcp={tcp}");
+                let reply = if tcp { tcp_message(addr, &message) } else { udp_message(addr, &message) };
+                assert_eq!(reply.metadata.message_type, MessageType::Response, "{label}");
+                assert_eq!(reply.metadata.op_code, OpCode::Query, "{label}");
+                assert_eq!(reply.metadata.id, id, "{label}");
+                assert_eq!(reply.metadata.recursion_desired, rd, "{label}: RD is copied from the query");
+                assert!(!reply.metadata.truncation, "{label}");
+                assert_eq!(reply.queries.len(), 1, "{label}");
+                assert_eq!(
+                    reply.queries[0].name().to_ascii(),
+                    message.queries[0].name().to_ascii(),
+                    "{label}: question echoed with its case"
+                );
+                assert_eq!(reply.queries[0].query_type(), rtype, "{label}");
+                assert_eq!(reply.metadata.response_code, code, "{label}");
+                assert_eq!(reply.answers.len(), count, "{label}");
+                if forwarded {
+                    assert!(!reply.metadata.authoritative, "{label}: a forwarder is not authoritative");
+                } else if name.ends_with("in-addr.arpa") {
+                    assert!(reply.metadata.authoritative, "{label}: a local zone answers authoritatively");
+                }
+                if count == 0 {
+                    let soa = reply.authorities.iter().filter(|r| r.data.record_type() == RecordType::SOA).count();
+                    assert_eq!(soa, 1, "{label}: a negative answer carries its SOA");
+                }
+            }
+        }
+    }
+    let order = |name: &str, rtype| udp_message(addr, &typed_query(name, 500, rtype, None));
+    let a = order("multi.test", RecordType::A);
+    let octets: Vec<_> =
+        a.answers.iter().filter_map(|r| if let RData::A(a) = &r.data { Some(a.0.octets()[3]) } else { None }).collect();
+    assert_eq!(octets, [30, 10, 20], "answers are not reordered or dropped");
+    let mx = order("mx.test", RecordType::MX);
+    let prefs: Vec<_> =
+        mx.answers.iter().filter_map(|r| if let RData::MX(m) = &r.data { Some(m.preference) } else { None }).collect();
+    assert_eq!(prefs, [20, 10], "MX records keep the upstream order");
+    let chain = order("alias.test", RecordType::A);
+    let kinds: Vec<_> = chain.answers.iter().map(|r| r.data.record_type()).collect();
+    assert_eq!(kinds, [RecordType::CNAME, RecordType::A, RecordType::A], "the CNAME precedes its target's data");
+}
+
+/// A raw query: `flags` is the whole second header word, `opt` is
+/// (EDNS version, advertised size, DO).
+fn raw_query(id: u16, flags: u16, name: &str, qtype: u16, qclass: u16, opt: Option<(u8, u16, bool)>) -> Vec<u8> {
+    let mut raw = id.to_be_bytes().to_vec();
+    raw.extend_from_slice(&flags.to_be_bytes());
+    raw.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, u8::from(opt.is_some())]);
+    for label in name.split('.') {
+        raw.push(u8::try_from(label.len()).unwrap());
+        raw.extend_from_slice(label.as_bytes());
+    }
+    raw.push(0);
+    raw.extend_from_slice(&qtype.to_be_bytes());
+    raw.extend_from_slice(&qclass.to_be_bytes());
+    if let Some((version, size, dnssec)) = opt {
+        raw.push(0);
+        raw.extend_from_slice(&41u16.to_be_bytes());
+        raw.extend_from_slice(&size.to_be_bytes());
+        raw.extend_from_slice(&[0, version, if dnssec { 0x80 } else { 0 }, 0, 0, 0]);
+    }
+    raw
+}
+
+/// Whether `raw` is a response (QR=1) carrying `id`.
+fn is_reply_to(raw: &[u8], id: u16) -> bool {
+    raw.len() >= 12 && u16::from_be_bytes([raw[0], raw[1]]) == id && raw[2] & 0x80 != 0
+}
+
+/// RFC 8906 s1: a name server responds to every well-formed query, using the
+/// response codes, and never drops one for being unfamiliar. Sweeps every
+/// QTYPE 0-255 and some unassigned ones, assorted QCLASSes, every opcode,
+/// query flag bits, and EDNS versions 0-3, over UDP and TCP; each must get a
+/// response with its own ID and QR=1.
+#[test]
+fn rfc8906_s132_every_well_formed_query_gets_a_response() {
+    let mock = RfcMock::start(|question| Some(mock_answer(question)));
+    let addr = free_addr();
+    let dir = temp_dir("rfc-sweep");
+    let mut server = Running::start(&dir, &config(addr, &dir, &[mock.addr], ""));
+    server.wait_ready();
+
+    let mut queries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut id = 1u16;
+    let mut add = |label: String, flags: u16, qtype: u16, qclass: u16, opt: Option<(u8, u16, bool)>| {
+        id += 1;
+        queries.push((label, raw_query(id, flags, "sweep.test", qtype, qclass, opt)));
+    };
+    for qtype in (0..=255u16).chain([256, 1000, 32_768, 65_280, 65_534, 65_535]) {
+        add(format!("qtype {qtype}"), 0x0100, qtype, 1, None);
+    }
+    for qclass in [0u16, 1, 2, 3, 4, 254, 255, 1234, 65_535] {
+        add(format!("qclass {qclass}"), 0x0100, 1, qclass, None);
+    }
+    for opcode in 0..=15u16 {
+        add(format!("opcode {opcode}"), 0x0100 | (opcode << 11), 1, 1, None);
+    }
+    for bit in [0x0400u16, 0x0200, 0x0080, 0x0040, 0x0020, 0x0010, 0x0000, 0x06F0] {
+        add(format!("flags {bit:#06x}"), bit, 1, 1, None);
+    }
+    for version in 0..=3u8 {
+        for dnssec in [false, true] {
+            for size in [0u16, 512, 1232, 65_535] {
+                add(format!("edns v{version} do={dnssec} size={size}"), 0x0100, 1, 1, Some((version, size, dnssec)));
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    let mut stream: Option<TcpStream> = None;
+    for (label, raw) in &queries {
+        let id = u16::from_be_bytes([raw[0], raw[1]]);
+        if !udp_raw(addr, raw, Duration::from_secs(3)).is_some_and(|reply| is_reply_to(&reply, id)) {
+            missing.push(format!("UDP {label}"));
+        }
+        let connection = stream.get_or_insert_with(|| tcp_connect(addr));
+        let answered =
+            tcp_send(connection, raw).is_ok() && tcp_receive_raw(connection).is_ok_and(|reply| is_reply_to(&reply, id));
+        if !answered {
+            missing.push(format!("TCP {label}"));
+            stream = None;
+        }
+    }
+    assert!(missing.is_empty(), "{} of {} exchanges got no response: {missing:?}", missing.len(), queries.len() * 2);
+}
+
+/// RFC 8906 s1: unless under attack, a name server responds to all requests.
+/// With the limiter on (1 qps, burst 40) a mixed stream of ordinary and
+/// unusual UDP and TCP requests, half the burst, is answered in full; drops
+/// begin only after the allowance is spent.
+#[test]
+fn rfc8906_s136_requests_are_answered_until_the_rate_limit_is_exceeded() {
+    let mock = RfcMock::start(|question| Some(mock_answer(question)));
+    let addr = free_addr();
+    let dir = temp_dir("rfc-not-attacked");
+    let mut server =
+        Running::start(&dir, &config(addr, &dir, &[mock.addr], "rate_limit_qps = 1\nrate_limit_burst = 40"));
+    server.wait_ready();
+
+    let mut stream = tcp_connect(addr);
+    for index in 0..20u16 {
+        let qtype = [1, 16, 65_280, 255][usize::from(index % 4)];
+        let raw = raw_query(index + 1, 0x0100, "limit.test", qtype, 1, None);
+        let reply = if index % 2 == 0 {
+            udp_raw(addr, &raw, Duration::from_secs(3))
+        } else {
+            tcp_send(&mut stream, &raw).unwrap();
+            tcp_receive_raw(&mut stream).ok()
+        };
+        assert!(reply.is_some_and(|r| is_reply_to(&r, index + 1)), "request {index} within the allowance is answered");
+    }
+
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+    for index in 0..100u16 {
+        socket.send_to(&raw_query(1000 + index, 0x0100, "limit.test", 1, 1, None), addr).unwrap();
+    }
+    let mut answered = 0;
+    let mut buf = [0u8; 512];
+    while socket.recv_from(&mut buf).is_ok() {
+        answered += 1;
+    }
+    assert!(answered >= 20, "the remaining allowance (20 of 40) is answered in full: {answered}");
+    assert!(answered < 100, "requests beyond the allowance are dropped: {answered} of 100 answered");
 }

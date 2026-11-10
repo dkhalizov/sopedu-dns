@@ -170,6 +170,11 @@ impl LeaderGuard {
         // Joins are serialized by the map lock: once the entry is gone no new
         // sender can be registered, so draining the list cannot lose a waiter.
         let senders = std::mem::take(&mut *lock(&self.waiter.senders));
+        // Conformance fault: drop every sender unanswered (a cancelled wait).
+        #[cfg(feature = "conformance-adapter")]
+        if crate::upstream::take_fault("cancel_all_waiters") {
+            return;
+        }
         for sender in senders {
             let _ = sender.send(answer.clone());
         }

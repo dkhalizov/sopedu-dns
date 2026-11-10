@@ -211,11 +211,13 @@ struct Adapter {
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     base: Option<Instant>,
     carry: Carry,
+    /// A running `memory_profile`; its samples come back on a later call.
+    profile: Option<tokio::task::JoinHandle<Rpc>>,
 }
 
 impl Adapter {
     fn new() -> Self {
-        Self { dir: None, config: Map::new(), task: None, base: None, carry: Carry::default() }
+        Self { dir: None, config: Map::new(), task: None, base: None, carry: Carry::default(), profile: None }
     }
 
     async fn call(&mut self, method: &str, params: &Value) -> Rpc {
@@ -235,6 +237,9 @@ impl Adapter {
             "reload" => self.reload(params).await,
             "restart" => self.restart().await,
             "refresh_lists" => self.refresh_lists().await,
+            "memory_profile" => self.memory_profile().await,
+            "health" => self.health(params).await,
+            "multi_address_probe" => self.multi_address_probe().await,
             other => Err(unsupported(format!("{other}: not provided by this adapter"))),
         }
     }
@@ -269,6 +274,12 @@ impl Adapter {
             "packet-lifecycle",
             "request-upstream-observer",
             "refresh-cache-control",
+            "health",
+            "multi-address",
+            "memory-profile",
+            "local-routing",
+            "faults",
+            "hash-collision",
         ];
         if VIRTUAL_CLOCK.load(Ordering::SeqCst) {
             capabilities.push("clock");
@@ -311,6 +322,30 @@ impl Adapter {
             }
             Some(other) => return Err(unsupported(format!("stale_mode {other:?} is not a profile this build maps"))),
         }
+        // The driver's per-zone local routes: a forward route for home.arpa is
+        // the product's `home_arpa_server` (RFC 8375 §4). Routes or empty-zone
+        // data for any other zone are not built, so they are unsupported.
+        if let Some(overrides) = config.remove("local_zone_overrides") {
+            let routes = overrides.as_object().ok_or_else(|| unsupported("local_zone_overrides is not a table"))?;
+            for (zone, route) in routes {
+                let home = zone.trim_end_matches('.').eq_ignore_ascii_case("home.arpa");
+                let forward = route.as_object().is_some_and(|fields| fields.len() == 2)
+                    && route["mode"].as_str() == Some("forward");
+                // `home_arpa_server` is one plain address; a DoH route is not built.
+                match route["upstream"].as_str() {
+                    Some(upstream) if home && forward && upstream.parse::<std::net::SocketAddr>().is_ok() => {
+                        config.insert("home_arpa_server".into(), json!(upstream));
+                    }
+                    _ => {
+                        return Err(unsupported(format!(
+                            "local_zone_overrides for {zone}: only a home.arpa forward route to a plain \
+                             address is built (home_arpa_server); DoH routes, per-zone routes and empty-zone \
+                             data for other zones are not"
+                        )));
+                    }
+                }
+            }
+        }
         Ok(config)
     }
 
@@ -347,9 +382,9 @@ impl Adapter {
                 std::env::set_var("SSL_CERT_DIR", "");
             }
         }
-        let listen = self.config.get("listen").and_then(Value::as_str).unwrap_or_default().to_string();
+        let listen = self.config.get("listen").cloned().unwrap_or(Value::Null);
         self.write_config(None)?;
-        self.launch(&listen).await?;
+        self.launch(&listen.to_string()).await?;
         Ok(json!({"listen": listen}))
     }
 
@@ -650,8 +685,23 @@ impl Adapter {
     }
 
     fn inject(params: &Value) -> Rpc {
+        if let Some(fault) = params["fault"].as_str() {
+            return if sopedu_dns::upstream::inject_fault(fault) {
+                Ok(json!({"armed": fault}))
+            } else {
+                Err(unsupported(format!("inject: unknown fault {fault:?}")))
+            };
+        }
+        if let Some(hash) = params.get("constant_hash") {
+            // Cache table only. The blocklist matcher stores bare 64-bit
+            // fingerprints and compares no bytes, so a forced collision there
+            // would change decisions by design; it is not hooked.
+            let hash = hash.as_u64().ok_or_else(|| error("constant_hash must be a nonnegative integer"))?;
+            sopedu_dns::cache::force_hash(Some(hash));
+            return Ok(json!({"constant_hash": hash}));
+        }
         let Some(ids) = params["rng_ids"].as_array() else {
-            return Err(unsupported("inject: only rng_ids is provided by this adapter"));
+            return Err(unsupported("inject: only rng_ids, fault and constant_hash are provided by this adapter"));
         };
         let ids: Vec<u16> = ids.iter().filter_map(|id| id.as_u64().and_then(|id| u16::try_from(id).ok())).collect();
         sopedu_dns::upstream::inject_ids(&ids);
@@ -694,10 +744,149 @@ impl Adapter {
 
     async fn restart(&mut self) -> Rpc {
         self.shutdown(&json!({"timeout": 6})).await?;
-        let listen = self.config.get("listen").and_then(Value::as_str).unwrap_or_default().to_string();
+        Self::reset_stats();
+        let listen = self.config.get("listen").cloned().unwrap_or(Value::Null);
         self.write_config(None)?;
-        self.launch(&listen).await?;
+        self.launch(&listen.to_string()).await?;
         Ok(json!({"alive": self.alive()}))
+    }
+
+    /// A restarted process starts its counters at zero; this one keeps the
+    /// process-wide statistics across the in-process restart. `restore` only adds,
+    /// so add the two's complement of the totals: atomic adds wrap in every build.
+    fn reset_stats() {
+        use sopedu_dns::stats::{self, HistSnap};
+        let mut saved = stats::global().snapshot();
+        let negate = |hist: &mut HistSnap| {
+            hist.buckets.iter_mut().for_each(|n| *n = n.wrapping_neg());
+            hist.sum_us = hist.sum_us.wrapping_neg();
+        };
+        saved.outcomes.iter_mut().for_each(|n| *n = n.wrapping_neg());
+        saved.upstream_errors = saved.upstream_errors.wrapping_neg();
+        saved.plain_fallback = saved.plain_fallback.wrapping_neg();
+        negate(&mut saved.request);
+        saved.upstream.iter_mut().for_each(negate);
+        stats::global().restore(&saved);
+    }
+
+    /// Process and readiness state without the UI listener. `upstream_degraded`
+    /// is the production upstream state: every circuit open (what `/healthz`
+    /// reports as not ready) or a failure marker still suppressing a name.
+    /// With `query_name` the name also goes through the normal request path
+    /// (`handle_admitted`), so the failure cache applies to it.
+    async fn health(&mut self, params: &Value) -> Rpc {
+        let server = self.handles(|handles| handles.server.clone())?;
+        let mut result = {
+            let runtime = server.runtime();
+            json!({
+                "liveness": self.alive(),
+                "local_ready": server.ready.load(Ordering::SeqCst),
+                "upstream_degraded": !runtime.upstreams.ready() || runtime.upstreams.failing(),
+                "ui_enabled": runtime.cfg.ui_enabled,
+            })
+        };
+        if let Some(name) = params["query_name"].as_str() {
+            let name = Name::from_ascii(format!("{}.", name.trim_end_matches('.'))).map_err(error)?;
+            let mut query = Message::new(0, MessageType::Query, OpCode::Query);
+            query.metadata.recursion_desired = true;
+            query.add_query(hickory_proto::op::Query::query(name, RecordType::A));
+            let raw = query.to_vec().map_err(error)?;
+            let runtime = server.runtime();
+            let client = IpAddr::from(std::net::Ipv4Addr::LOCALHOST);
+            let answer = server.handle_admitted(&runtime, &raw, client, true, Instant::now()).await;
+            settle().await;
+            result["probe_rcode"] = json!(answer.and_then(|a| a.get(3).map(|b| b & 0x0f)));
+        }
+        Ok(result)
+    }
+
+    /// Sends a real query to each address the server listens on and reports
+    /// where the reply came from. A wildcard listener is probed on 127.0.0.1
+    /// and 127.0.0.2 (the latter exists on Linux only; an address this host
+    /// cannot send to is left out, never faked). A server listening on fewer
+    /// than two probeable addresses is first restarted on the wildcard of
+    /// its own port, so the probe always exercises the pktinfo reply path.
+    async fn multi_address_probe(&mut self) -> Rpc {
+        let mut targets = self.probe_targets()?;
+        if targets.len() < 2 {
+            let port = self.handles(|handles| handles.server.runtime().cfg.listen[0].port())?;
+            self.config.insert("listen".into(), json!([format!("0.0.0.0:{port}")]));
+            self.restart().await?;
+            targets = self.probe_targets()?;
+        }
+        let mut probes = Vec::new();
+        for destination in targets {
+            let bind: SocketAddr =
+                if destination.is_ipv4() { "127.0.0.1:0" } else { "[::1]:0" }.parse().map_err(error)?;
+            let socket = std::net::UdpSocket::bind(bind).map_err(error)?;
+            socket.set_nonblocking(true).map_err(error)?;
+            let mut query = Message::new(0x4d41, MessageType::Query, OpCode::Query);
+            query.metadata.recursion_desired = true;
+            query.add_query(hickory_proto::op::Query::query(
+                Name::from_ascii("localhost.").map_err(error)?,
+                RecordType::A,
+            ));
+            if socket.send_to(&query.to_vec().map_err(error)?, destination).is_err() {
+                continue;
+            }
+            let mut buf = [0u8; 512];
+            let wall = std::time::Instant::now() + Duration::from_secs(3);
+            let source = loop {
+                match socket.recv_from(&mut buf) {
+                    Ok((_, source)) => break source,
+                    Err(failure) if failure.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > wall {
+                            // Only Linux has 127.0.0.2 on lo by default; elsewhere
+                            // a silent address is a host limit, on Linux a failure.
+                            if !cfg!(target_os = "linux")
+                                && destination.ip().is_loopback()
+                                && destination.ip() != IpAddr::from([127, 0, 0, 1])
+                            {
+                                break SocketAddr::from(([0, 0, 0, 0], 0));
+                            }
+                            return Err(error(format!("no reply from {destination} within the wall budget")));
+                        }
+                        real_sleep(Duration::from_millis(2)).await;
+                        tokio::task::yield_now().await;
+                    }
+                    // ICMP unreachable: the host has no such address.
+                    Err(_) => break SocketAddr::from(([0, 0, 0, 0], 0)),
+                }
+            };
+            if source.port() == 0 {
+                continue;
+            }
+            probes.push(json!({
+                "query_destination": [destination.ip().to_string(), destination.port()],
+                "reply_source": [source.ip().to_string(), source.port()],
+            }));
+        }
+        Ok(json!({"probes": probes}))
+    }
+
+    /// Where a probe can be sent: each specific listen address, and the
+    /// loopback addresses of a wildcard one.
+    fn probe_targets(&self) -> std::result::Result<Vec<SocketAddr>, Failure> {
+        let listen = self.handles(|handles| handles.server.runtime().cfg.listen.clone())?;
+        let mut targets: Vec<SocketAddr> = Vec::new();
+        for addr in listen {
+            let found: Vec<SocketAddr> = match addr.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => ["127.0.0.1", "127.0.0.2"]
+                    .iter()
+                    .map(|ip| SocketAddr::new(ip.parse().unwrap(), addr.port()))
+                    .collect(),
+                IpAddr::V6(ip) if ip.is_unspecified() => {
+                    vec![SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), addr.port())]
+                }
+                _ => vec![addr],
+            };
+            for found in found {
+                if !targets.contains(&found) {
+                    targets.push(found);
+                }
+            }
+        }
+        Ok(targets)
     }
 
     async fn refresh_lists(&mut self) -> Rpc {
@@ -706,5 +895,123 @@ impl Adapter {
         let outcome = server.refresh_lists(&runtime).await;
         settle().await;
         Ok(json!({"completed": true, "error": outcome.err()}))
+    }
+
+    /// Spec O3 evidence: whole-process RSS every 10 ms while a list refresh
+    /// builds the new rule set next to the live one and the cache, until the
+    /// swap. Linux only (`/proc/self/status`). A refresh can outlast one RPC,
+    /// so the first call starts it and returns `{"running": true}`; later
+    /// calls return that until the samples are ready.
+    async fn memory_profile(&mut self) -> Rpc {
+        match self.profile.take() {
+            Some(task) if task.is_finished() => task.await.map_err(error)?,
+            Some(task) => {
+                self.profile = Some(task);
+                Ok(json!({"running": true}))
+            }
+            None => {
+                let server = self.handles(|handles| handles.server.clone())?;
+                self.profile = Some(tokio::spawn(Self::profile_refresh(server)));
+                Ok(json!({"running": true}))
+            }
+        }
+    }
+
+    async fn profile_refresh(server: Arc<Server>) -> Rpc {
+        fn status_kib(field: &str) -> Option<u64> {
+            let status = std::fs::read_to_string("/proc/self/status").ok()?;
+            let line = status.lines().find(|line| line.starts_with(field))?;
+            line.split_whitespace().nth(1)?.parse().ok()
+        }
+        status_kib("VmRSS:").ok_or_else(|| unsupported("memory_profile needs /proc/self/status (Linux)"))?;
+        let runtime = server.runtime();
+        let old_rules = runtime.rules.clone();
+        let cache_limit = runtime.cfg.cache_bytes;
+        let started = Instant::now();
+        let refresh = {
+            let server = server.clone();
+            tokio::spawn(async move { server.refresh_lists(&runtime).await })
+        };
+        let sample = |builder_active: bool| {
+            let (_, charged, ..) = server.runtime().cache.observe();
+            json!({
+                "time_ms": started.elapsed().as_millis() as u64,
+                "rss_bytes": status_kib("VmRSS:").unwrap_or(0) * 1024,
+                "cache_charged_bytes": charged,
+                // References to the pre-refresh rule set other than this probe's.
+                "old_snapshot_count": Arc::strong_count(&old_rules) - 1,
+                "builder_active": builder_active,
+            })
+        };
+        let mut samples = Vec::new();
+        while !refresh.is_finished() {
+            samples.push(sample(true));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let outcome = refresh.await.map_err(error)?;
+        samples.push(sample(false));
+        Ok(json!({
+            "samples": samples,
+            "cache_limit_bytes": cache_limit,
+            "peak_rss_bytes": status_kib("VmHWM:").unwrap_or(0) * 1024,
+            "rules": server.runtime().rules.len(),
+            "error": outcome.err(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn local_zone_overrides_map_only_the_home_route() {
+        let mut adapter = Adapter::new();
+        let home = json!({"local_zone_overrides": {"home.arpa.": {"mode": "forward", "upstream": "127.0.0.1:5353"}}});
+        adapter.config = home.as_object().unwrap().clone();
+        let config = adapter.profile_config().ok().expect("a home.arpa route maps");
+        assert_eq!(config["home_arpa_server"], "127.0.0.1:5353");
+        assert!(!config.contains_key("local_zone_overrides"));
+        for other in [
+            json!({"10.in-addr.arpa": {"mode": "forward", "upstream": "127.0.0.1:5353"}}),
+            json!({"home.arpa": {"mode": "empty", "soa_mname": "ns.home.arpa"}}),
+            json!({"home.arpa": {"mode": "forward", "upstream": "https://127.0.0.1:8443/dns-query"}}),
+        ] {
+            adapter.config = json!({"local_zone_overrides": other}).as_object().unwrap().clone();
+            assert!(adapter.profile_config().is_err(), "{other}: not built, so unsupported");
+        }
+    }
+
+    /// One test body: the adapter owns process-wide state (HANDLES, cwd).
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_and_multi_address_controls() {
+        VIRTUAL_CLOCK.store(false, Ordering::SeqCst);
+        let mut adapter = Adapter::new();
+        let config = json!({"listen": format!("127.0.0.1:{}", free_port()), "ui_enabled": false, "upstreams": []});
+        adapter.start(&json!({"config": config})).await.ok().expect("start");
+        let health = adapter.health(&json!({})).await.ok().expect("health");
+        assert_eq!(health["liveness"], true);
+        assert_eq!(health["local_ready"], true);
+        assert_eq!(health["upstream_degraded"], false);
+        assert_eq!(health["ui_enabled"], false);
+        let probed = adapter.health(&json!({"query_name": "localhost"})).await.ok().expect("probe");
+        assert_eq!(probed["probe_rcode"], 0, "the probe went through the request path");
+
+        let probes = adapter.multi_address_probe().await.unwrap_or_else(|failure| match failure {
+            Failure::Error(reason) | Failure::Unsupported(reason) => panic!("probe: {reason}"),
+        });
+        let probes = probes["probes"].as_array().unwrap();
+        assert!(!probes.is_empty());
+        // 127.0.0.2 is configured by default on Linux only.
+        #[cfg(target_os = "linux")]
+        assert!(probes.len() >= 2);
+        for probe in probes {
+            assert_eq!(probe["reply_source"], probe["query_destination"]);
+        }
+        adapter.shutdown(&json!({})).await.ok().expect("shutdown");
     }
 }

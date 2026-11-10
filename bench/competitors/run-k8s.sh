@@ -164,7 +164,7 @@ wait_ready() {
 for TRANSPORT in $TRANSPORTS; do
   for SERVER in "${servers[@]}"; do
     if [ "$TRANSPORT" = doh ] && [[ "$SERVER" == pihole* || "$SERVER" == unbound || "$SERVER" == dnsmasq || "$SERVER" == numa ]]; then
-      note_row skipped "$SERVER has no DoH upstream client in this harness"
+      note_row skipped "$SERVER has no DoH upstream client in this setup"
       continue
     fi
     echo "== $SERVER ($TRANSPORT) on $NODE =="

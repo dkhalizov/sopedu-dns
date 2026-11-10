@@ -50,5 +50,7 @@ When you publish the draft release, `.github/workflows/crates.yml` checks out
 the tag, checks that it matches the crate version and runs
 `cargo publish --locked`. The job runs in the `crates-io` environment, which
 only accepts `v*` tags and waits for a maintainer to approve it, because a
-published version cannot be changed or deleted. It authenticates with
-crates.io trusted publishing (a short-lived OIDC token, nothing stored).
+published version cannot be changed or deleted. It uses crates.io trusted
+publishing (a short-lived OIDC token) once that is set up for the repository;
+until then it uses a `CARGO_REGISTRY_TOKEN` secret in the `crates-io`
+environment.

@@ -35,7 +35,7 @@ RUN cargo test --locked
 
 # Benchmark stage: the same musl release binary in a Debian userland that
 # has dnsperf and python3. Build explicitly with
-# `docker build --target bench -t sopedu-dns-io2-bench .`.
+# `docker build --target bench -t sopedu-dns-bench .`.
 FROM rust:1.99-alpine@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS bench-build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /build
@@ -57,7 +57,7 @@ CMD ["sh"]
 # Allocator comparison: three release binaries from the same source
 # (default musl malloc, mimalloc, jemalloc) collected in one Debian userland
 # with dnsperf. Build explicitly with
-# `docker build --target alloc-bench -t sopedu-dns-bld1-bench .`; the
+# `docker build --target alloc-bench -t sopedu-dns-alloc-bench .`; the
 # production `scratch` image below is unchanged.
 FROM bench-build AS alloc-build
 RUN mkdir -p /out \

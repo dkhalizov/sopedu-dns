@@ -10,3 +10,6 @@ state_dir = "/state"
 blocklists = ["@LISTS@/filter_1.txt", "@LISTS@/filter_24.txt", "@LISTS@/filter_27.txt", "@LISTS@/filter_51.txt"]
 user_rules = []
 no_filter_clients = []
+# Query log off, like AdGuard Home (querylog/statistics off), Blocky
+# (queryLog none) and pihole-lean; Unbound and dnsmasq keep none.
+query_log_capacity = 0

@@ -119,13 +119,31 @@ pub fn zone_for(name: &str) -> Option<ZoneMatch> {
     None
 }
 
-/// True when a PTR query must be forwarded because `private_ptr = "forward"`.
+/// True when `private_ptr = "forward"` sends the query upstream: any type in a
+/// local reverse zone (the RFC 6303 §3 opt-out), and a PTR outside those zones.
 /// Shared CGN space (100.64.0.0/10) is exempt: RFC 6598 §4 forbids sending its
-/// reverse queries to global DNS, so it stays local in every mode.
-pub fn forwards_ptr(cfg: &Config, qtype: u16, name: &str) -> bool {
-    cfg.private_ptr == PrivatePtr::Forward
-        && qtype == TYPE_PTR
-        && !zone_for(name).is_some_and(|zone| zone.apex.ends_with(".100.in-addr.arpa"))
+/// reverse queries to global DNS, so it stays local in every mode. So are the
+/// `.arpa` special-use zones, which are not reverse zones.
+pub fn forwards_reverse(cfg: &Config, qtype: u16, name: &str) -> bool {
+    // RFC 6303 §3 SHOULD: the opt-out per zone, too.
+    if !cfg.forward_reverse_zones.is_empty()
+        && zone_for(name)
+            .is_some_and(|zone| zone.kind == ZoneKind::Reverse && cfg.forward_reverse_zones.contains(&zone.apex))
+    {
+        return true;
+    }
+    if cfg.private_ptr != PrivatePtr::Forward {
+        return false;
+    }
+    match zone_for(name) {
+        Some(zone) => zone.kind == ZoneKind::Reverse && !zone.apex.ends_with(".100.in-addr.arpa"),
+        None => qtype == TYPE_PTR,
+    }
+}
+
+/// True when `home_arpa_server` takes queries for `name` (RFC 8375 §4).
+pub fn forwards_home(cfg: &Config, name: &str) -> bool {
+    cfg.home_arpa_server.is_some() && zone_for(name).is_some_and(|zone| zone.apex == "home.arpa")
 }
 
 /// True when the local reverse logic answers a query with `name` (lowercase,
@@ -133,10 +151,10 @@ pub fn forwards_ptr(cfg: &Config, qtype: u16, name: &str) -> bool {
 ///
 /// This mirrors the reply builder in the binary exactly and is used only to
 /// choose the parsed slow path, so a cached entry can never bypass a local
-/// reverse answer. The `private_ptr = "forward"` PTR opt-out and the
-/// DS probe at any local zone apex with DO=1 are the two exceptions.
+/// reverse answer. The `private_ptr = "forward"` opt-out and the DS probe at
+/// any local zone apex with DO=1 are the two exceptions.
 pub fn may_answer(cfg: &Config, qtype: u16, name: &str, do_bit: bool) -> bool {
-    if forwards_ptr(cfg, qtype, name) {
+    if forwards_reverse(cfg, qtype, name) || forwards_home(cfg, name) {
         return false;
     }
     if qtype == TYPE_PTR {
@@ -193,9 +211,7 @@ fn ip6_zone(prefix: &[&str]) -> Option<usize> {
         ["f", "c" | "d", ..] => Some(2),
         ["f", "e", "8" | "9" | "a" | "b", ..] => Some(3),
         ["2", "0", "0", "1", "0", "d", "b", "8", ..] => Some(8),
-        [rest @ .., last] if top.len() == 32 && rest.iter().all(|l| *l == "0") && matches!(*last, "0" | "1") => {
-            Some(32)
-        }
+        _ if top.len() >= 32 && top[..31].iter().all(|l| *l == "0") && matches!(top[31], "0" | "1") => Some(32),
         _ => None,
     }
 }
@@ -203,6 +219,20 @@ fn ip6_zone(prefix: &[&str]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc9665_s1411_names_below_the_unspecified_and_loopback_zones_are_local() {
+        let zeros = "0.".repeat(31);
+        for last in ["0", "1"] {
+            let apex = format!("{last}.{zeros}ip6.arpa");
+            assert!(zone_for(&apex).is_some_and(|zone| zone.is_apex), "{apex}");
+            let below = zone_for(&format!("x.{apex}")).expect("a name below the zone is local");
+            assert!(!below.is_apex);
+            assert_eq!(below.apex, apex);
+        }
+        assert!(zone_for(&format!("2.{zeros}ip6.arpa")).is_none(), "::2 is not a listed zone");
+        assert!(zone_for(&format!("x.2.{zeros}ip6.arpa")).is_none());
+    }
 
     #[test]
     fn cgn_reverse_is_never_forwarded_even_in_forward_mode() {
@@ -215,6 +245,30 @@ mod tests {
         assert!(!may_answer(&cfg, TYPE_PTR, "1.0.0.10.in-addr.arpa", false));
         // 100.128/9 is public.
         assert!(!may_answer(&cfg, TYPE_PTR, "1.128.100.in-addr.arpa", false));
+    }
+
+    /// RFC 6303 §3: the opt-out may be chosen zone by zone.
+    #[test]
+    fn rfc6303_s194_one_reverse_zone_can_be_forwarded_on_its_own() {
+        let mut cfg = Config { forward_reverse_zones: vec!["168.192.IN-ADDR.ARPA.".into()], ..Config::default() };
+        cfg.validate().unwrap();
+        assert_eq!(cfg.forward_reverse_zones, ["168.192.in-addr.arpa"], "normalized");
+        for (qtype, name) in
+            [(TYPE_PTR, "1.1.168.192.in-addr.arpa"), (TYPE_PTR, "168.192.in-addr.arpa"), (6, "168.192.in-addr.arpa")]
+        {
+            assert!(forwards_reverse(&cfg, qtype, name), "{name}");
+            assert!(!may_answer(&cfg, qtype, name, false), "{name}");
+        }
+        assert!(may_answer(&cfg, TYPE_PTR, "1.0.0.10.in-addr.arpa", false), "other zones stay local");
+        assert!(may_answer(&cfg, TYPE_PTR, "1.1.16.172.in-addr.arpa", false), "other zones stay local");
+
+        for zone in ["0.10.in-addr.arpa", "64.100.in-addr.arpa", "example.com", "8.8.in-addr.arpa", "home.arpa"] {
+            let mut bad = Config { forward_reverse_zones: vec![zone.into()], ..Config::default() };
+            assert!(bad.validate().is_err(), "{zone} is rejected");
+        }
+        let mut v6 = Config { forward_reverse_zones: vec!["d.f.ip6.arpa".into()], ..Config::default() };
+        v6.validate().unwrap();
+        assert!(!may_answer(&v6, TYPE_PTR, &v6_reverse("fd00::1".parse().unwrap()), false), "an IPv6 zone too");
     }
 
     fn v6_reverse(address: Ipv6Addr) -> String {

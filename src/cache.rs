@@ -77,6 +77,57 @@ impl Hash for CacheKey {
     }
 }
 
+/// The hasher of the cache table. The conformance adapter can force every
+/// hash to one constant (`hooked::force`); the table still compares keys, so
+/// colliding names stay distinct. Release builds use the plain hasher.
+#[cfg(not(feature = "conformance-adapter"))]
+type CacheHashBuilder = DefaultHashBuilder;
+#[cfg(feature = "conformance-adapter")]
+type CacheHashBuilder = hooked::Builder;
+
+#[cfg(feature = "conformance-adapter")]
+pub use hooked::force as force_hash;
+
+#[cfg(feature = "conformance-adapter")]
+mod hooked {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    static ON: AtomicBool = AtomicBool::new(false);
+    static VALUE: AtomicU64 = AtomicU64::new(0);
+
+    /// Forces every cache-table hash to `value`, or restores hashing on `None`.
+    pub fn force(value: Option<u64>) {
+        VALUE.store(value.unwrap_or(0), Ordering::SeqCst);
+        ON.store(value.is_some(), Ordering::SeqCst);
+    }
+
+    #[derive(Clone, Default)]
+    pub struct Builder(DefaultHashBuilder);
+
+    pub struct Hook(<DefaultHashBuilder as BuildHasher>::Hasher);
+
+    impl BuildHasher for Builder {
+        type Hasher = Hook;
+        fn build_hasher(&self) -> Hook {
+            Hook(self.0.build_hasher())
+        }
+    }
+
+    impl Hasher for Hook {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.write(bytes);
+        }
+        fn finish(&self) -> u64 {
+            if ON.load(Ordering::Relaxed) {
+                VALUE.load(Ordering::Relaxed)
+            } else {
+                self.0.finish()
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 #[repr(C)]
 struct Entry {
@@ -209,7 +260,7 @@ pub struct HitMeta {
 }
 
 pub struct Cache {
-    inner: Option<QuickCache<CacheKey, Arc<Entry>, ByteWeighter>>,
+    inner: Option<QuickCache<CacheKey, Arc<Entry>, ByteWeighter, CacheHashBuilder>>,
     start: Instant,
     bytes: u64,
     negative_min: u32,
@@ -247,7 +298,7 @@ impl Cache {
             QuickCache::with_options(
                 options,
                 ByteWeighter { min_weight },
-                DefaultHashBuilder::default(),
+                CacheHashBuilder::default(),
                 DefaultLifecycle::default(),
             )
         });
@@ -466,6 +517,11 @@ impl Cache {
         {
             return None;
         }
+        // RFC 1035 §7.4: data learned for a name with a "*" label must never
+        // build wildcard answers for other names, so none of it is cached.
+        if msg.queries.first().is_some_and(|q| q.name().iter().any(|label| label == b"*")) {
+            return None;
+        }
         let fields = crate::wire::ttl_fields(raw)?;
 
         // Age and cap every stored TTL before it defines a lifetime.
@@ -526,10 +582,14 @@ impl Cache {
 
         // Every RR keeps its own aged lifetime (RFC 1035 §3.2.1, RFC 2181 §8);
         // the template is fresh only until the earliest of them (`orig_ttl`).
-        // The cache has no validation-lifetime metadata, so a stored template
-        // never asserts AD (RFC 6840 §5.8); only the first, directly relayed
-        // answer from a trusted upstream can carry it.
-        crate::wire::clear_ad(&mut stored);
+        // AD is kept as stored: the caller clears it for anything but a
+        // trusted DoH answer to an AD or DO client. A validating upstream caps
+        // TTLs at its signatures' expiry (RFC 4035 §5.3.3), so a fresh hit is as
+        // authentic as the first answer; a stale hit clears AD (`patch_entry`).
+        // An answer learned over untrusted plaintext never asserts AD.
+        if plain {
+            crate::wire::clear_ad(&mut stored);
+        }
         let mut flags = 0;
         if negative {
             flags |= NEGATIVE;
@@ -648,7 +708,11 @@ const INVALIDATED_TYPES: [u16; 16] = [1, 2, 5, 6, 12, 15, 16, 28, 33, 35, 43, 48
 /// combination: O(1) work on an insert that already followed an upstream
 /// round trip. Known limit: an unusual QTYPE keeps its old entry until it ages
 /// out; a name-to-keys reverse index would close that if it ever matters.
-fn invalidate_terminal_name(cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter>, key: &[u8], msg: &Message) {
+fn invalidate_terminal_name(
+    cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter, CacheHashBuilder>,
+    key: &[u8],
+    msg: &Message,
+) {
     let Some(query) = msg.queries.first() else { return };
     let mut name = query.name().clone();
     for _ in 0..8 {
@@ -668,7 +732,11 @@ fn invalidate_terminal_name(cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighte
 /// not an ordinary answer and stays: each chain keeps its own entry.
 const ALIAS_OWNERS: usize = 4;
 
-fn invalidate_alias_owners(cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter>, key: &[u8], msg: &Message) {
+fn invalidate_alias_owners(
+    cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter, CacheHashBuilder>,
+    key: &[u8],
+    msg: &Message,
+) {
     let mut done: Vec<&Name> = Vec::new();
     for record in &msg.answers {
         if matches!(record.data, RData::CNAME(_)) && !done.contains(&&record.name) && done.len() < ALIAS_OWNERS {
@@ -682,7 +750,7 @@ fn invalidate_alias_owners(cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter
 /// class of `key`, except `key` itself and, with `keep_aliases`, entries that
 /// hold a CNAME at `name`.
 fn invalidate_owner(
-    cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter>,
+    cache: &QuickCache<CacheKey, Arc<Entry>, ByteWeighter, CacheHashBuilder>,
     key: &[u8],
     name: &Name,
     keep_aliases: bool,
@@ -789,17 +857,26 @@ fn answer_kind(msg: &Message) -> AnswerKind {
 
 /// RFC 2308 §5: `min(SOA TTL, SOA MINIMUM)`, minus the HTTP Age.
 fn negative_ttl(msg: &Message, age: u32) -> Option<u32> {
-    // RFC 2308 §5: only an SOA at or above the name (or a CNAME target) sets
-    // the negative lifetime; an unrelated SOA does not.
-    let qname = msg.queries.first().map(|q| q.name().clone());
-    let mut names: Vec<_> = qname.into_iter().collect();
-    names.extend(msg.answers.iter().filter_map(|r| match &r.data {
-        RData::CNAME(target) => Some(target.0.clone()),
-        _ => None,
-    }));
+    // RFC 1034 §4.3.4 and RFC 2308 §5: the SOA that sets the lifetime is the
+    // one of the zone holding the name the denial is about. That is the end of
+    // the CNAME chain from QNAME: the aliases are positive data from their own
+    // zones, the denial concerns the name they lead to.
+    let mut denied = msg.queries.first().map(|q| q.name().clone());
+    for _ in 0..crate::wire::MAX_CHAIN_STEPS {
+        let next = denied.as_ref().and_then(|current| {
+            msg.answers.iter().find_map(|r| match &r.data {
+                RData::CNAME(target) if r.name == *current => Some(target.0.clone()),
+                _ => None,
+            })
+        });
+        match next {
+            Some(target) => denied = Some(target),
+            None => break,
+        }
+    }
     let mut ttl = None;
     for record in &msg.authorities {
-        if !names.iter().any(|name| record.name.zone_of(name)) {
+        if !denied.as_ref().is_some_and(|name| record.name.zone_of(name)) {
             continue;
         }
         if let RData::SOA(soa) = &record.data {
@@ -961,8 +1038,9 @@ mod tests {
         assert!(hit.had_edns);
         assert_eq!(Message::from_vec(&hit.raw).unwrap().metadata.id, 123);
         assert_eq!(answer_ttl(&hit.raw, 0), 100);
-        // No validation-lifetime metadata, so a hit never asserts AD.
-        assert_eq!(wire::header(&hit.raw).unwrap().flags & 0x20, 0);
+        // A fresh hit keeps the AD it was stored with (the caller stores AD
+        // only for a trusted DoH answer to an AD or DO client).
+        assert_eq!(wire::header(&hit.raw).unwrap().flags & 0x20, 0x20);
 
         c.backdate(&key, 40);
         let hit = c.get(&key, 2, 43_200).unwrap();
@@ -977,16 +1055,7 @@ mod tests {
         assert!(hit.stale);
         assert_eq!(hit.remaining_ttl, 0);
         assert_eq!(answer_ttl(&hit.raw, 0), 30);
-        assert_eq!(wire::header(&hit.raw).unwrap().flags & 0x20, 0);
-
-        // AD is never stored, whatever the client asked for.
-        let (_, plain) = query_key("ad.test", 1, 1, 0, false);
-        let (mut ad_msg, _) = positive("ad.test.", RecordType::A, 100, 1, false);
-        ad_msg.metadata.authentic_data = true;
-        let ad_raw = ad_msg.to_vec().unwrap();
-        assert!(c.insert(&plain, &ad_raw, &ad_msg, 0));
-        let hit = c.get(&plain, 1, 43_200).unwrap();
-        assert_eq!(wire::header(&hit.raw).unwrap().flags & 0x20, 0);
+        assert_eq!(wire::header(&hit.raw).unwrap().flags & 0x20, 0, "a stale hit never asserts AD");
     }
 
     #[test]
@@ -1891,5 +1960,228 @@ mod tests {
         assert!(!c.evict(&key, false), "nothing left to remove");
         assert!(c.insert(&key, &raw, &msg, 0));
         assert!(c.evict(&key, false), "a fresh entry goes when stale-only is off");
+    }
+}
+
+#[cfg(test)]
+mod rfc_tests {
+    use super::*;
+    use crate::wire;
+    use hickory_proto::{
+        op::{MessageType, OpCode, Query},
+        rr::{
+            rdata::{A, NULL, SOA},
+            Name, Record, RecordType,
+        },
+    };
+
+    fn name(text: &str) -> Name {
+        Name::from_ascii(text).unwrap()
+    }
+
+    /// Canonical key for a plain IN query (no EDNS, no flags).
+    fn key_for(text: &str, qtype: u16) -> Vec<u8> {
+        let mut raw = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in text.trim_end_matches('.').split('.') {
+            raw.push(label.len() as u8);
+            raw.extend_from_slice(label.as_bytes());
+        }
+        raw.push(0);
+        raw.extend_from_slice(&qtype.to_be_bytes());
+        raw.extend_from_slice(&[0, 1]);
+        let view = wire::parse_query(&raw).unwrap();
+        let mut buffer = [0u8; wire::MIN_CANONICAL_BUFFER];
+        let len = wire::canonical_key(&view, &mut buffer).unwrap();
+        buffer[..len].to_vec()
+    }
+
+    fn a_rr(owner: &str, ttl: u32, last: u8) -> Record {
+        Record::from_rdata(name(owner), ttl, RData::A(A::new(192, 0, 2, last)))
+    }
+
+    /// A response to `qname`/A with the given sections.
+    fn reply(
+        qname: &str,
+        rcode: ResponseCode,
+        answers: Vec<Record>,
+        authorities: Vec<Record>,
+        additionals: Vec<Record>,
+    ) -> (Message, Vec<u8>) {
+        let mut msg = Message::new(0x1234, MessageType::Response, OpCode::Query);
+        msg.metadata.recursion_desired = true;
+        msg.metadata.recursion_available = true;
+        msg.metadata.response_code = rcode;
+        msg.add_query(Query::query(name(qname), RecordType::A));
+        for r in answers {
+            msg.add_answer(r);
+        }
+        for r in authorities {
+            msg.add_authority(r);
+        }
+        for r in additionals {
+            msg.add_additional(r);
+        }
+        let raw = msg.to_vec().unwrap();
+        (msg, raw)
+    }
+
+    fn soa_at(owner: &str, ttl: u32) -> Record {
+        Record::from_rdata(name(owner), ttl, RData::SOA(SOA::new(Name::root(), Name::root(), 0, 0, 0, 0, 300)))
+    }
+
+    /// A partial RRSIG (type 46) RR, as a hostile or sloppy upstream might attach.
+    fn rrsig_at(owner: &str) -> Record {
+        Record::from_rdata(
+            name(owner),
+            300,
+            RData::Unknown { code: RecordType::from(46u16), rdata: NULL::with(vec![0; 18]) },
+        )
+    }
+
+    #[test]
+    fn rfc1034_s1503_soa_is_selected_by_owner_name() {
+        // RFC 1034 4.3.4: the SOA mechanism applies "only" to data matching QNAME.
+        // An SOA owned by an unrelated zone ("example.") does not set the
+        // negative lifetime for n.test.
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        let key = key_for("n.test", 1);
+        let (msg, raw) = reply("n.test.", ResponseCode::NXDomain, vec![], vec![soa_at("example.", 60)], vec![]);
+        assert_eq!(c.negative_lifetime(&msg, 0), None);
+        assert!(!c.insert(&key, &raw, &msg, 0), "unrelated SOA must not be cached as a negative");
+        assert!(c.get(&key, 1, 43_200).is_none());
+        // Control: the same reply with the SOA at the zone of the name is cached.
+        let (msg, raw) = reply("n.test.", ResponseCode::NXDomain, vec![], vec![soa_at("test.", 60)], vec![]);
+        assert_eq!(c.negative_lifetime(&msg, 0), Some(60));
+        assert!(c.insert(&key, &raw, &msg, 0));
+    }
+
+    #[test]
+    fn rfc1034_s1503_negative_ttl_uses_the_soa_of_the_denied_name() {
+        // alias.test CNAME host.example, then NODATA for host.example. The
+        // denial is about host.example, so the SOA of example. (TTL 100) sets
+        // the lifetime, not the SOA of test. (TTL 30) that covers only the
+        // alias, whichever comes first.
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        let cname = vec![Record::from_rdata(
+            name("alias.test."),
+            300,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(name("host.example."))),
+        )];
+        for soas in
+            [vec![soa_at("example.", 100), soa_at("test.", 30)], vec![soa_at("test.", 30), soa_at("example.", 100)]]
+        {
+            let (msg, _) = reply("alias.test.", ResponseCode::NoError, cname.clone(), soas, vec![]);
+            assert_eq!(c.negative_lifetime(&msg, 0), Some(100));
+        }
+        // An SOA that covers only the alias does not answer for the target.
+        let (msg, _) = reply("alias.test.", ResponseCode::NoError, cname, vec![soa_at("test.", 30)], vec![]);
+        assert_eq!(c.negative_lifetime(&msg, 0), None);
+    }
+
+    #[test]
+    fn rfc1035_s2641_star_label_data_never_builds_a_wildcard_answer() {
+        // RFC 1035 7.4: data from a query whose QNAME contains "*" must not be
+        // used to construct wildcard answers for other names.
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        let star = key_for("*.wild.test", 1);
+        let (msg, raw) =
+            reply("*.wild.test.", ResponseCode::NoError, vec![a_rr("*.wild.test.", 300, 1)], vec![], vec![]);
+        // RFC 1035 §7.4: such an answer is not cached at all, not even for
+        // the literal "*" name.
+        assert!(!c.insert(&star, &raw, &msg, 0));
+        assert!(c.get(&star, 1, 43_200).is_none());
+        assert!(c.get(&key_for("host.wild.test", 1), 1, 43_200).is_none());
+        assert!(c.get(&key_for("a.b.wild.test", 1), 1, 43_200).is_none());
+        assert!(c.get(&key_for("wild.test", 1), 1, 43_200).is_none());
+    }
+
+    #[test]
+    fn rfc2181_s270_sig_outside_the_answer_section_is_never_cached_as_a_sig_answer() {
+        // RFC 2181 5.3.1: a SIG in Authority or Additional is almost certainly a
+        // partial RRSet and must not be returned for a later SIG query (s270, s273).
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        for (owner, in_additional) in [("add.test", true), ("auth.test", false)] {
+            let fqdn = format!("{owner}.");
+            let sig = vec![rrsig_at(&fqdn)];
+            let (msg, raw) = if in_additional {
+                reply(&fqdn, ResponseCode::NoError, vec![a_rr(&fqdn, 300, 1)], vec![], sig)
+            } else {
+                reply(&fqdn, ResponseCode::NoError, vec![a_rr(&fqdn, 300, 1)], sig, vec![])
+            };
+            assert!(c.insert(&key_for(owner, 1), &raw, &msg, 0));
+            assert!(c.get(&key_for(owner, 1), 1, 43_200).is_some(), "the A answer itself is cached");
+            for qtype in [46u16, 255] {
+                assert!(
+                    c.get(&key_for(owner, qtype), 1, 43_200).is_none(),
+                    "{owner}: partial SIG must not answer a type {qtype} query"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rfc2181_s333_identical_rrset_refreshes_the_cached_ttl() {
+        // RFC 2181 5.4: an identical RRSet may update the cached TTL, and should
+        // when the new answer ranks at least as high. All forwarded answers
+        // share one rank, so the later TTL replaces the older, partly spent one.
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        let key = key_for("ttl.test", 1);
+        let (msg, raw) = reply("ttl.test.", ResponseCode::NoError, vec![a_rr("ttl.test.", 60, 1)], vec![], vec![]);
+        assert!(c.insert(&key, &raw, &msg, 0));
+        c.backdate(&key, 40);
+        assert_eq!(c.get(&key, 1, 43_200).unwrap().remaining_ttl, 20);
+        let (msg, raw) = reply("ttl.test.", ResponseCode::NoError, vec![a_rr("ttl.test.", 300, 1)], vec![], vec![]);
+        assert!(c.insert(&key, &raw, &msg, 0));
+        let hit = c.get(&key, 1, 43_200).unwrap();
+        assert_eq!(hit.orig_ttl, 300);
+        assert_eq!(hit.remaining_ttl, 300);
+    }
+
+    #[test]
+    fn rfc2181_s356_additional_data_never_creates_or_replaces_a_cached_answer() {
+        // RFC 2181 5.4.1: additional information is ignored when the cache holds
+        // an answer for the name.
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        let x = key_for("x.test", 1);
+        let (msg, raw) = reply("x.test.", ResponseCode::NoError, vec![a_rr("x.test.", 300, 1)], vec![], vec![]);
+        assert!(c.insert(&x, &raw, &msg, 0));
+        let (msg, raw) = reply(
+            "y.test.",
+            ResponseCode::NoError,
+            vec![a_rr("y.test.", 300, 9)],
+            vec![],
+            vec![a_rr("x.test.", 3600, 66), a_rr("z.test.", 3600, 77)],
+        );
+        assert!(c.insert(&key_for("y.test", 1), &raw, &msg, 0));
+        let hit = c.get(&x, 1, 43_200).unwrap();
+        let cached = Message::from_vec(&hit.raw).unwrap();
+        assert_eq!(cached.answers.len(), 1);
+        assert_eq!(cached.answers[0].data, RData::A(A::new(192, 0, 2, 1)), "original address kept");
+        assert_eq!(hit.orig_ttl, 300, "original TTL kept");
+        assert!(c.get(&key_for("z.test", 1), 1, 43_200).is_none(), "additional data is not an entry");
+    }
+
+    #[test]
+    fn rfc6891_s356_upstream_opt_is_not_replayed_from_the_cache() {
+        // RFC 6891 6.1.1: OPT RRs MUST NOT be cached or forwarded. The OPT in a
+        // served hit is the forwarder's own: no upstream option, no upstream flags.
+        let c = Cache::new(10, 1 << 20, 0, 10_800);
+        let key = key_for("opt.test", 1);
+        let (_, mut raw) = reply("opt.test.", ResponseCode::NoError, vec![a_rr("opt.test.", 300, 1)], vec![], vec![]);
+        raw[10..12].copy_from_slice(&1u16.to_be_bytes());
+        // OPT: root, type 41, payload 4096, ext-rcode 0, version 0, flags 0xbfff,
+        // one option, code 65001 (0xfde9), data de ad be ef.
+        raw.extend_from_slice(&[
+            0, 0, 41, 0x10, 0x00, 0, 0, 0xbf, 0xff, 0, 8, 0xfd, 0xe9, 0, 4, 0xde, 0xad, 0xbe, 0xef,
+        ]);
+        let msg = Message::from_vec(&raw).unwrap();
+        assert!(msg.edns.is_some());
+        assert!(c.insert(&key, &raw, &msg, 0));
+        let mut hit = c.get(&key, 1, 43_200).unwrap().raw;
+        assert!(wire::present_for_client(&mut hit, true, false, false, 1232));
+        // Exactly one OPT, the forwarder's: payload 1232, flags 0, no options.
+        assert_eq!(u16::from_be_bytes([hit[10], hit[11]]), 1);
+        assert_eq!(hit[hit.len() - 11..], [0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+        assert!(!hit.windows(4).any(|w| w == [0xde, 0xad, 0xbe, 0xef]), "upstream option bytes replayed");
     }
 }

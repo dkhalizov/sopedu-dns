@@ -1113,7 +1113,6 @@ struct ListParser<'a> {
 
 impl<'a> ListParser<'a> {
     fn new(hasher: &'a RandomState, max_bytes: u64, max_lines: u64, quota: u64) -> Self {
-        #[cfg(feature = "conformance-adapter")]
         observed::LIMIT_BYTES.store(max_bytes, std::sync::atomic::Ordering::SeqCst);
         Self {
             hasher,
@@ -1153,7 +1152,6 @@ impl<'a> ListParser<'a> {
             self.kept = start + (chunk.len() - rest.len()) as u64;
         }
         self.push(rest);
-        #[cfg(feature = "conformance-adapter")]
         self.observe_buffers();
     }
 
@@ -1208,7 +1206,6 @@ impl<'a> ListParser<'a> {
 
     fn stop(&mut self, message: &str) {
         if self.error.is_none() {
-            #[cfg(feature = "conformance-adapter")]
             observed::REJECTED_OVERSIZE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.error = Some(message.to_string());
         }
@@ -1218,9 +1215,8 @@ impl<'a> ListParser<'a> {
     }
 }
 
-/// Test-only observation of the streaming parser (conformance adapter): lists
-/// stopped by a size bound and the largest live parse buffers seen.
-#[cfg(feature = "conformance-adapter")]
+/// Observation of the streaming parser, reported in `/metrics`: lists stopped
+/// by a size bound and the largest live parse buffers seen.
 pub mod observed {
     use std::sync::atomic::{AtomicU64, Ordering};
 

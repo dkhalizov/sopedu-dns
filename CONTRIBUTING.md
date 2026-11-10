@@ -46,7 +46,7 @@ benchmark document under `docs/bench/`, follow these rules:
   sopedu-dns commit, and the version or image digest of everything compared.
 - Run open loop, at least 3 rounds (more is better), and report the median
   with the min-max range. Latency percentiles are p50, p90, p99, p99.9 and
-  max; loss gets its own column. Discard runs where the client misses 99% of the target rate.
+  max; loss gets its own column. Discard runs where the client sends less than 99% of the target rate.
 - Prefer a synthetic, public, deterministic corpus. You may use a real query
   log for a headline run only if it stays out of the repo (no private
   hostnames or addresses), the write-up says the input is private and its

@@ -98,7 +98,7 @@ dig @127.0.0.1 -p 15353 nas.home.arpa AAAA  # NOERROR, empty answer
 curl -s http://127.0.0.1:9999/healthz       # "ok" once a blocklist has loaded and an upstream is reachable
 ```
 
-The examples use port 15353 because mDNS already holds UDP 5353 on macOS.
+The examples assume `listen = "127.0.0.1:15353"`. They use port 15353 because mDNS already holds UDP 5353 on macOS.
 
 ## 2. Before pointing real clients at it
 
@@ -107,7 +107,7 @@ of them.
 
 | Setting | Default | What to do |
 |---|---|---|
-| `listen` | `0.0.0.0:53` | One address string, or an array of 1 to 16 for a dual-stack LAN: `listen = ["192.168.1.11:53", "[2001:db8::11]:53"]`. Each address gets its own UDP socket set and TCP listener. Every IPv6 socket is `IPV6_V6ONLY`, so `[::]:53` does not take IPv4 too and can sit beside an IPv4 address (a single dual-stack `[::]:53` fails when `systemd-resolved` holds `127.0.0.53:53`). Duplicates are rejected. On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. Listening on all addresses is safe because `allowed_clients` refuses non-LAN sources, and on a host with several addresses replies leave from the address the client queried (`IP_PKTINFO`, Linux and macOS; a specific address needs nothing). That costs about 10% of cache-hit throughput, so on a busy server bind the one LAN address instead. |
+| `listen` | `0.0.0.0:53` | One address string, or an array of 1 to 16 for a dual-stack LAN: `listen = ["192.168.1.11:53", "[2001:db8::11]:53"]`. Each address gets its own UDP socket set and TCP listener. Every IPv6 socket is `IPV6_V6ONLY`, so `[::]:53` does not take IPv4 too and can sit beside an IPv4 address (a single dual-stack `[::]:53` fails when `systemd-resolved` holds `127.0.0.53:53`). Duplicates and port 0 are rejected, because a server listens on a fixed port. On Linux, port 53 needs root or `CAP_NET_BIND_SERVICE`. Listening on all addresses is safe because `allowed_clients` refuses non-LAN sources, and on a host with several addresses replies leave from the address the client queried (`IP_PKTINFO`, Linux and macOS; a specific address needs nothing). That costs about 10% of cache-hit throughput, so on a busy server bind the one LAN address instead. |
 | `upstreams`, `fallback` | Cloudflare and Google DoH; no plain-DNS fallback | Every cache miss goes to these resolvers; change them if you don't want that. `fallback` (for example `["1.1.1.1:53"]`) adds plain DNS servers, tried only when every DoH upstream fails at the transport level (no connection or TLS session). An HTTP error status, a reset request or an invalid reply never triggers it. It is off by default because plain DNS is unauthenticated: anyone who can block port 443 could force the downgrade and forge answers. Each use is counted in `dns_plain_fallback_answers_total` and logged as `plaintext_fallback_used`, at most once a minute. |
 | `blocklists` | none | Add list URLs (`http://` or `https://`), or nothing is blocked. Many big lists use more memory; see [Memory](#16-memory). |
 | `allowed_clients` | loopback, RFC 1918, link-local, `fc00::/7` | Covers an IPv4 home network. A Tailscale tailnet (`100.64.0.0/10`) is opt-in. Home IPv6 usually uses global addresses, which are refused until you add your LAN /64 (see [Access control](#6-access-control-and-rate-limiting)). Never use `0.0.0.0/0` on an internet-facing host. |
@@ -187,6 +187,32 @@ port has an open resolver. Set a narrow `allowed_clients` in your config or
 bind the publish to one LAN address (`-p 192.168.1.2:53:53/udp`). Never
 publish port 53 on a public interface.
 
+#### Docker Compose
+
+Save this as `compose.yaml`, with your `config.toml` next to it (keep
+`state_dir = "/var/lib/sopedu-dns"` in it):
+
+```yaml
+services:
+  sopedu-dns:
+    image: ghcr.io/dkhalizov/sopedu-dns:1.1.0
+    network_mode: host
+    user: "0"
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    read_only: true
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/etc/sopedu-dns/config.toml:ro
+      - sopedu-state:/var/lib/sopedu-dns
+
+volumes:
+  sopedu-state:
+```
+
+Run `docker compose up -d`. The root filesystem is read-only, so cached lists
+can only be written to the volume.
+
 ### Kubernetes
 
 Set the image in `deploy/kubernetes.yaml`, then:
@@ -213,10 +239,11 @@ it from a file capability. So the container runs as uid 0 with
 only privilege: the image's own user (uid 65532) is overridden to uid 0 for
 the bind, and the binary is unchanged.
 `/state` is a root-owned emptyDir, so uid 0 can write the list cache through
-the owner bits. `fsGroup: 0` is not needed, and the read-only root filesystem
+the owner bits. The manifest also sets `fsGroup: 0`, which is redundant, and
+the read-only root filesystem
 covers only the container rootfs, not the volume. We don't set
 `net.ipv4.ip_unprivileged_port_start=53` instead, because with `hostNetwork`
-it changes the whole node, not just this pod. Our checks do not exercise the
+it changes the whole node. Our checks do not exercise the
 bind on a real cluster; verify it on yours.
 
 #### Pod Security Admission
@@ -276,7 +303,7 @@ server writes nothing anywhere else.
 | `cannot read config.toml: No such file or directory` | No argument was given and there is no `config.toml` in the current directory. |
 | `invalid config: ... (line N)` | A TOML syntax error, wrong type or unknown key at that line. The offending value is hidden on purpose, so look at the line. |
 | `msg=blocklist_refresh_failed error=no blocklist or user rules available: <list>: <reason>` | Every list failed and none is cached. DNS still works, unfiltered, `/healthz` returns 503, and the refresh retries every 60 seconds. |
-| `msg=no_upstreams reason=upstreams_and_fallback_empty` (warning) | Nothing is configured to resolve with; only cached, blocked and local answers work. Add an `upstreams` URL. |
+| `msg=no_upstreams hint="upstreams and fallback are both empty; ..."` (warning) | Nothing is configured to resolve with; only cached, blocked and local answers work. Add an `upstreams` URL. |
 | `msg=plaintext_fallback_used count=N` (warning, at most once a minute) | Every DoH upstream failed at the transport level and N answers since the last warning came over the unauthenticated plain `fallback`. Check why port 443 to the DoH upstreams fails. |
 | `msg=ui_exposed reason=ui_has_no_login` (warning) | `ui_listen` is not a loopback address, so anyone who can reach it sees the query log. |
 
@@ -302,7 +329,7 @@ reload.
 | `udp_rcvbuf_bytes` | `1048576` (a 1 MiB request) | 0 (OS default) or 4096..=67108864 | restart |
 | `udp_sndbuf_bytes` | `0` (OS default) | 0 or 4096..=67108864 | restart |
 | `udp_inflight_max` | `1024` | 1..=65536 | restart |
-| `udp_max_payload` | `1232` | at least 512 | yes |
+| `udp_max_payload` | `1232` | at least 512; above 1400 is lowered to 1400 (RFC 9715 section 3.1) | yes |
 | `udp_discard_timeout_ms` | `1900` | 0 (off)..=60000; the effective limit is never below `serve_stale_client_timeout_ms` + 100 ms | yes |
 | `tcp_max_connections` | `256` | 1..=65536 | restart |
 | `tcp_max_connections_per_client` | `32` | 1..=65536 | restart |
@@ -318,14 +345,21 @@ reload.
 | `upstream_strategy` | `"fastest"` | `"fastest"` or `"ordered"` | yes |
 | `fallback` | `[]` | plain DNS `ip:port`; not the listen address itself | yes |
 | `trust_plain_upstreams` | `false` | | yes |
+| `home_arpa_server` | unset | `"ip:port"` of the authoritative server for `home.arpa` | yes |
 | `upstream_timeout_seconds` | `5` | 1..=60 | yes |
 | `upstream_hedge_ms` | `50` | 0 (derived)..=5000 | yes |
+| `failure_cache_seconds` | `5` | 1..=300 | yes |
 | `upstream_inflight_max` | `256` | 1..=65536 | yes |
 | `upstream_inflight_per_client` | `64` | 0 (off)..=65536 | yes |
 | `upstream_0x20` | `true` | | yes |
+| `upstream_source_ports_exclude` | `[]` | Ports or `"first-last"` ranges (each in 1..=65535) never used as the source port of a plain upstream UDP query, for example `["49152-49200", "5353"]`. Queries choose from 1024..=65535 (RFC 5452 section 9.2 asks for a range as large as practicable), and the list must leave at least one port there. The `listen` and `ui_listen` ports are always excluded. List here any port another local service binds, so a restart of that service never finds it briefly held by a query. | yes |
 | `forward_test_names` | `false` | | yes |
 | `dnssec` | `"passthrough"` | `"passthrough"` or `"always_upstream"` | yes |
 | `private_ptr` | `"nxdomain"` | `"nxdomain"` or `"forward"` | yes |
+| `forward_reverse_zones` | `[]` | apexes of the local reverse zones below, such as `"168.192.in-addr.arpa"`; not the shared CGNAT zones | yes |
+| `empty_zone_soa_rname` | `"nobody.invalid."` | a valid DNS name | yes |
+| `empty_zone_ttl` | `10` | 0..=2147483647 (RFC 2181 section 8) | yes |
+| `empty_zone_ns` | the zone apex | a valid DNS name | yes |
 
 An IP literal in a DoH URL needs no bootstrap DNS. Hostnames work too and are
 resolved through the host's or container's DNS.
@@ -381,7 +415,7 @@ RFC 2308's three-hour ceiling.
 |---|---|---|---|
 | `state_dir` | `"state"` | | yes |
 | `prewarm` | `true` | | yes |
-| `prewarm_count` | `1000` | 0..=10000 | restart |
+| `prewarm_count` | `1000` | 0..=10000 | a decrease on reload, an increase on restart |
 | `persist_stats` | `true` | | yes |
 | `ui_enabled` | `true` | | restart |
 | `ui_listen` | `"127.0.0.1:9999"` | | restart |
@@ -412,8 +446,10 @@ rebuilt. That reload logs `cache_reset=true`.
 
 The single-flight map, and with it the cache, is rebuilt when any setting
 that affects upstreams changes: `upstreams`, `fallback`,
-`upstream_timeout_seconds`, `upstream_hedge_ms`, `upstream_strategy`,
-`upstream_0x20`, `trust_plain_upstreams`, `forward_test_names`,
+`upstream_timeout_seconds`, `upstream_hedge_ms`, `failure_cache_seconds`, `upstream_strategy`,
+`upstream_0x20`, `upstream_source_ports_exclude`, `trust_plain_upstreams`,
+`home_arpa_server`,
+`forward_test_names`,
 `upstream_inflight_max` or `dnssec`. A request under the new generation never
 joins a leader or reads an answer from the old pool. A change to `prefetch`
 or `serve_stale_client_timeout_ms` applies to new requests and resets neither
@@ -425,7 +461,8 @@ the Tokio runtime, so these keys need a restart: `listen` (the whole list),
 `tcp_max_connections_per_client`, `tcp_queries_per_connection`,
 `tcp_pipeline_max`, `tcp_idle_timeout_seconds`, `udp_batch`,
 `udp_inflight_max`, `udp_workers`, `udp_rcvbuf_bytes`, `udp_sndbuf_bytes`,
-`worker_threads`, `prewarm_count` and `query_log_capacity`. A reload that
+`worker_threads`, `query_log_capacity` and an increase of `prewarm_count`
+(a decrease applies on reload). A reload that
 changes one logs `restart_required` with the field and its old and new
 values, and keeps the old behaviour until you restart.
 
@@ -467,7 +504,7 @@ allowed_clients = [
 
 The server never adds its own on-link prefix on its own, because on a VPS that
 subnet is shared with strangers. When it refuses a source inside one of the
-host's global on-link prefixes, it logs one `client_refused_onlink` warning
+host's global or unique-local IPv6 on-link prefixes, it logs one `client_refused_onlink` warning
 per prefix with `hint=add_to_allowed_clients`. The prefixes are re-read at
 most once a minute.
 
@@ -526,30 +563,39 @@ link-local, CGNAT or unique-local space gets NXDOMAIN with the usual TTL-10
 SOA. At their apex the matching reverse zones answer SOA and NS
 authoritatively (AA=1, TTL and MINIMUM 10, NS target and MNAME equal to the
 apex), NODATA for other types, and NXDOMAIN with the SOA for names below.
-Matching is by whole labels. `private_ptr = "forward"` forwards PTR queries
-instead.
+`empty_zone_soa_rname`, `empty_zone_ttl` and `empty_zone_ns` change the SOA
+RNAME, the TTL and MINIMUM, and the NS target for all of these empty zones,
+including `home.arpa`, `service.arpa` and `resolver.arpa`.
+Matching is by whole labels. `private_ptr = "forward"` turns this off and
+forwards every query for these reverse zones instead, except shared CGNAT
+space, which RFC 6598 keeps local. To forward only some of them, list their
+apexes in `forward_reverse_zones` (RFC 6303 section 3 asks for the choice
+zone by zone); the rest stay local.
 
 ### Special-use names
 
 These never leave the host. `.onion`, `.invalid` and `.test` get NXDOMAIN,
 `localhost` resolves to loopback, and `home.arpa`, `service.arpa`,
 `resolver.arpa` and the RFC 6303 reverse zones are answered as local empty
-zones. Set `forward_test_names = true` to send `.test` upstream.
+zones; names below `resolver.arpa` get NODATA rather than NXDOMAIN
+(RFC 9462 section 6.4). Set `forward_test_names = true` to send `.test` upstream. Set
+`home_arpa_server` to send `home.arpa` to its authoritative server on your
+network (RFC 8375). The DS query with DO at the apex still goes upstream.
 
 In all of these local zones, a `DS` query for the zone apex with DO=1 is
 forwarded. The DS lives in the signed parent, and a validating client needs
-that proof, not a local NODATA it cannot verify (RFC 4035 3.1.4.1, RFC 6303
-section 7, RFC 8375).
+that proof; a local NODATA is something it cannot verify (RFC 4035 3.1.4.1,
+RFC 6303 section 7, RFC 8375).
 
 ### EDNS
 
 The client's EDNS OPT record is never forwarded (RFC 6891 section 6.1.1). The
 upstream query carries our own OPT with our payload size, only the DO and
-Compact Answers OK flags, and no client options (ECS, Cookie, NSID, padding or
-unknown codes). ECS, Cookie, keepalive and Padding do not prevent caching.
-Replies carry our own OPT too. An Extended DNS Error from the upstream is
-passed on with `upstream` added to its text, so clients don't mistake it for
-ours (RFC 8914 section 3).
+Compact Answers OK flags, and any unknown client option unchanged (RFC 5625
+section 3). ECS, Cookie, keepalive and Padding stay on the client side and do
+not prevent caching. Replies carry our own OPT too. An Extended DNS Error from
+the upstream is passed on with `upstream` added to its text, so clients don't
+mistake it for ours (RFC 8914 section 3).
 
 ### DNSSEC
 
@@ -559,9 +605,10 @@ The server does not validate signatures; DNSSEC records pass through.
 normalized and cached per client EDNS/DO/AD: DNSSEC records are stripped when
 the client did not set DO (unless it asked for a DNSSEC qtype), non-EDNS
 clients get no OPT, and AD follows the conservative profile, so a cache hit
-needs no rebuild. Upstream AD is kept only for clients that set AD or DO
-(conservative profile, RFC 6840). Plaintext fallback, truncated, local and
-stale answers always clear it. Stale answers can carry expired signatures,
+needs no rebuild. Upstream AD from a DoH upstream is kept only for clients
+that set AD or DO (conservative profile, RFC 6840), on the first answer and on
+fresh cache hits. Plaintext fallback, truncated, local and stale answers always
+clear it. Stale answers can carry expired signatures,
 which validating clients may reject.
 
 ## 8. Request handling order and refusals
@@ -574,7 +621,7 @@ ANY is never forwarded. Unless a rewrite, local zone, special-use name, block
 or `.local` answers it first, it gets the RFC 8482 minimal answer: one HINFO
 record (`"RFC8482" ""`, TTL 10).
 
-CHAOS queries and the three diagnostic names get REFUSED, and the refusal
+`version.bind`, `id.server` and `hostname.bind` get REFUSED in any class, and the refusal
 takes precedence.
 
 A malformed request with a readable header, including one with more than one
@@ -582,9 +629,22 @@ question, gets FORMERR. A request with no question gets REFUSED (RFC 9619).
 The server drops only packets too short for a header and responses sent as
 queries. A TCP framing error closes the connection.
 
-TSIG (type 250) and SIG(0) (type 24) are refused, never forwarded or cached.
+TSIG (type 250) and SIG(0) (type 24) signed messages and TKEY are forwarded
+byte for byte and their replies relayed unchanged, never cached, because any
+change would break the signature (RFC 5625). To a plain `fallback` server they
+always go over TCP: the message keeps the client's ID, so over UDP only the
+source port would stand between it and a spoofed reply. The server does not check the
+signatures. Name policy comes first, so a blocked or local name gets REFUSED.
 DNSSEC RRSIG (type 46) is not transaction authentication and follows the
 DNSSEC pass-through policy.
+
+Zone transfers go to a plain `fallback` server over TCP, message by message.
+AXFR over UDP gets REFUSED, and so does a transfer with no plain server, since
+DoH cannot carry one. At most 16 transfers are relayed at once; another one
+waits for a slot, and gets REFUSED if none frees within the upstream timeout. The server does not parse the transfer: it ends
+when the upstream closes or goes quiet, and after 10 minutes at most. Every client in `allowed_clients` can
+ask for a transfer, so a fallback server that trusts the forwarder's address
+for transfers trusts all of those clients too.
 
 With `block_cname_targets` (on by default) a query gets NXDOMAIN when a CNAME
 or DNAME target in the upstream answer is blocked, unless the query name is
@@ -619,8 +679,8 @@ outside Linux. On Linux, 1..=32 reads up to that many datagrams per `recvmmsg`
 call. Other platforms log `udp_batch_unsupported` once and use the
 single-datagram path. Replies, including inline cache hits, go out through the
 asynchronous `send_to`, so each send waits for writability and reports its
-own result. We tried `sendmmsg` and dropped it, because the safe API cannot
-report a partial batch and would lose replies without a trace. The batched
+own result. `sendmmsg` is not used, because the safe API cannot report a
+partial batch, so replies could be lost without a trace. The batched
 path reads each datagram into a 64 KiB slot, the same limit as the
 single-datagram path. A datagram that does not fit is dropped unparsed and
 counted as `udp_truncated`, a server-wide total logged on the first drop and
@@ -635,11 +695,17 @@ effective thread count.
 
 #### Answer size
 
-UDP answers stay within `udp_max_payload` (1232). The limit is
+UDP answers stay within `udp_max_payload` (1232). A value above the 1400
+bytes RFC 9715 section 3.1 recommends is lowered to 1400 with a warning. The limit is
 `min(max(client EDNS payload, 512), udp_max_payload)`, and non-EDNS clients
 get 512. An answer over the limit becomes a well-formed TC=1 reply with the
 question, AD cleared, no answers, and an OPT record only if the client sent
 EDNS. The full answer stays cached. TCP answers are never capped.
+
+Replies are sent with the don't-fragment flag over IPv6, and over IPv4 on
+macOS (Linux offers that for IPv4 only through path MTU discovery, which RFC
+9715 advises against). If a reply is still too large for the path, it goes
+again as the same TC=1 reply.
 
 #### Late answers
 
@@ -657,7 +723,10 @@ TCP checks `allowed_clients` right after accept and closes a disallowed peer
 before it can take a connection permit. It then accepts at most
 `tcp_max_connections_per_client` (32) connections from one address and
 `tcp_max_connections` (256) in total, and closes a new stream at once when
-either limit is full.
+either limit is full. At startup the server reads the open files limit
+(`RLIMIT_NOFILE`). If `tcp_max_connections` would leave less than 128
+descriptors plus the UDP sockets free, it lowers the value and logs
+`tcp_max_connections_clamped`.
 
 Each connection reads length-prefixed frames continuously and resolves up to
 `tcp_pipeline_max` (16) at a time. Each answer is written as soon as it is
@@ -730,12 +799,16 @@ provider and keep the others as backup.
 DoH requests use DNS ID 0 so responses are cacheable, POST
 `application/dns-message`, and require a 2xx `application/dns-message` reply.
 The HTTP `Age` is subtracted from both the relayed answer and the cache
-template. Redirects are followed at most five times and only to HTTPS, so a
-query body is never replayed over plain HTTP.
+template. A redirect is not followed: the query only ever reaches the
+configured URI, and a 3xx fails the attempt like any other non-success status.
+This is the policy choice RFC 8484 section 3 points at: a URI discovered
+outside the client's configuration grants no resolution privilege.
 
 A DNS-level failure (SERVFAIL, REFUSED, ...) from a reachable DoH upstream
-moves on to the next DoH upstream only. A SERVFAIL with a DNSSEC validation
-Extended DNS Error (5-12) is final and relayed.
+moves on to the next DoH upstream only. Extended DNS Errors do not change this
+(RFC 8914 §6), so a validation SERVFAIL also moves on. If you rely on upstream
+DNSSEC validation, list only validating upstreams: a non-validating one can
+answer a name a validating one rejected.
 
 If a DoH upstream is given by hostname and that name resolves through this
 server, a blocklist entry for it blocks the upstream. DoH then fails to
@@ -757,7 +830,7 @@ push an upstream to the back in `fastest` mode, or provoke a `Retry-After`
 that keeps it out while another upstream serves.
 
 A DoH circuit's cooldown starts at 30 seconds, doubles with each further
-failure, and stops at 600 seconds. Root-NS probes run in the background every
+failure, and stops at 300 seconds. Root-NS probes run in the background every
 30 seconds, with the first pass at startup, and one success closes the
 circuit.
 
@@ -785,6 +858,13 @@ invalid reply to a client query comes from a reachable upstream and may depend
 on the name, so the query ends in SERVFAIL with no downgrade. Running out of
 `upstream_timeout_seconds` also ends in SERVFAIL.
 
+A resolution that failed is not retried upstream for `failure_cache_seconds`
+(default 5, RFC 9520 section 3.2). Repeated failures of the same question
+double the window up to 30 seconds, or up to the configured value when that is
+larger. It never exceeds 300 seconds. The failure cache holds 4096 entries;
+when a flood of distinct failures fills it, entries are kept for at least one
+second and new failures go uncached until room frees up.
+
 Every answer from a fallback counts in `dns_plain_fallback_answers_total`, a
 `plaintext_fallback_used count=N` warning is logged at most once a minute,
 and the dashboard marks the upstreams "degraded". A single query whose DoH
@@ -794,6 +874,13 @@ carries traffic for longer only once every DoH circuit is open, and then
 
 A plain fallback that refuses or is unreachable is skipped for 5 seconds,
 doubling up to 60, while another fallback is usable.
+
+A UDP query to a fallback that stays silent is sent again after twice the
+server's smoothed round-trip time, between 2 and 5 seconds (2 seconds until a
+first reply has been measured). If the resend is also unanswered and time
+remains in `upstream_timeout_seconds`, the query is tried once over TCP to
+the same address while UDP keeps listening. With the default 5-second budget
+that means UDP at 0 s, the resend at 2 s and TCP at 4 s.
 
 #### Spoofing defences (RFC 5452)
 
@@ -808,21 +895,27 @@ are retried over TCP.
 
 #### Scrubbing
 
-Fallback replies are scrubbed: an off-chain Answer owner invalidates the
-reply, Authority keeps only SOA/NS/NSEC/NSEC3/RRSIG at or
-above the question, and Additional keeps only OPT. Their answers are cached
-for at most 300 s, never served stale and never prefetched. Set
+DoH and fallback replies are scrubbed: an off-chain Answer owner invalidates
+the reply, Authority keeps only SOA/NS/NSEC/NSEC3/RRSIG at or above the
+question, and Additional keeps only OPT. Fallback answers are cached for at
+most 300 s, never served stale and never prefetched. Set
 `trust_plain_upstreams = true` to treat plain servers as trusted primaries and
-lift these limits; the RFC 5452 checks still apply.
+lift these limits for them; the RFC 5452 checks still apply, and DoH replies
+are still scrubbed.
 
 ### What gets cached, and failure caching
 
-Terminal answers (positive, or NXDOMAIN/NODATA with SOA) are cached.
-Incomplete replies and referrals are returned but never cached. When every
-attempt fails, a failure marker keyed by the question and the EDNS/DO/CD/AD
-context suppresses repeat lookups for 5 seconds, doubling up to 30 seconds
-while the failures continue (RFC 9520). A query that was never sent (every
-upstream paused, no fallback) sets no marker.
+Terminal answers (positive, or NXDOMAIN/NODATA with SOA) are cached. A fresh
+NXDOMAIN for a name answers every QTYPE of that name (RFC 2308 §8). One at the
+end of a CNAME chain denies the chain's last name, not the alias, and answers
+that name directly (RFC 8020 §2). NODATA stays per QTYPE. Incomplete replies
+and referrals are returned but never cached. When every
+attempt fails, a failure marker keyed by the server, the question and the
+EDNS/DO/CD/AD context keeps that server out of repeat lookups for 5 seconds,
+doubling up to 30 seconds while the failures continue (RFC 9520, RFC 2308
+§7.1). A lookup with no unmarked server left is suppressed, and a server the
+failed attempt never reached is still tried. A query that was never sent
+(every upstream paused, no fallback) sets no marker.
 
 ## 11. Response cache and query coalescing
 
@@ -1118,11 +1211,8 @@ read-only, and the config stays the source of truth (GitOps).
   unconfigured `.local`, `Refused`, `Minimal ANY answer`, or `Forwarded` to
   the cache and upstreams), the reply (`NXDOMAIN`, `NOERROR 192.0.2.7`, ...)
   and whether the client is filtered. The tester does not look in the cache or
-  send anything. It runs the server's own decision code (`Runtime::policy`,
-  which `resolve` also calls, and the admission checks in `handle_with`)
-  without touching counters, the log or the cache, so it cannot disagree with
-  a real query. The tests `rule_tester_agrees_with_the_server` and
-  `ui_rules_and_clients_pages` compare it with real answers. For a
+  send anything. It runs the server's own decision code without touching counters, the log
+  or the cache, so it cannot disagree with a real query. For a
   `no_filter_clients` or `no_filter_macs` client the blocklist is skipped; the
   page says so and still lists the matching rules. The tester cannot see
   upstream CNAMEs, so it notes that a CNAME to a blocked name would also be
@@ -1243,6 +1333,13 @@ is on loopback. Liveness is a TCP check on :53.
 - `dns_upstream_duration_seconds{upstream}` (histogram, successful DoH
   exchanges, labelled by configured index, never by URL)
 - `dns_cache_entries`, `dns_cache_bytes`
+- `dns_upstream_inflight` (upstream exchanges in flight, at most
+  `upstream_inflight_max`) and `dns_udp_inflight` (UDP requests on the slow
+  path, at most `udp_inflight_max`)
+- `dns_blocklist_rejected_oversize_total` (lists stopped while streaming by
+  `blocklist_max_bytes` or `blocklist_max_lines`),
+  `dns_blocklist_buffer_peak_bytes` (the largest list parse buffer held) and
+  `dns_blocklist_buffer_limit_bytes` (the byte bound in force)
 - `dns_blocklist_rules{list}`, `dns_blocklist_last_success_timestamp{list}`
   (list is the sanitized display name, for example
   `https://host/filter_1.txt`; the timestamp is absent until a first success)
@@ -1277,7 +1374,11 @@ Measurements:
   a refresh, peaked at 74.1 MiB RSS. Neither number comes from a Linux pod.
 - On Linux (k3s pod, 1 CPU, 516k unique list rules from the same four lists), the
   process peak resident set (`VmHWM`) was 18.9 MiB idle and 18.9 MiB after the
-  full benchmark matrix ([final-2026-11-04.md](bench/final-2026-11-04.md)).
+  full benchmark matrix ([1.1.0.md](bench/1.1.0.md)).
+- On Linux (arm64 container) the worst case was measured directly on a
+  release build: a refresh of the same four lists while the 4 MiB cache was
+  96% full, the old rule set was still blocking and queries kept arriving.
+  The process peaked at 43.4 MiB RSS.
 
 ## 17. Building and the container image
 
@@ -1313,7 +1414,6 @@ image). For experiments, two optional features swap the global allocator:
 (`--features jemalloc`, through `tikv-jemallocator`). Enabling both fails
 with a `compile_error!`. Neither is on by default, so the shipped binary, the
 release profile and the Docker image stay the same unless a build opts in.
-Benchmarks showed no gain from either, so the default stays.
 
 ### Image
 

@@ -8,12 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hickory_proto::rr::Name;
 use serde::Deserialize;
 
 use crate::rules;
 
 /// Upper bound for `udp_batch`. The batched receive path sizes its per-worker
-/// slot arrays and payload buffer from it (32 x 4096 = 128 KiB).
+/// slot arrays and payload buffer from it (32 x 64 KiB = 2 MiB of address space).
 pub const MAX_UDP_BATCH: usize = 32;
 
 /// Upper bound for `listen` entries (each costs `udp_workers` sockets).
@@ -103,6 +104,11 @@ pub enum DnssecMode {
     Passthrough,
     AlwaysUpstream,
 }
+
+/// Source ports of plain upstream queries: every port from 1024 up, as
+/// large a range as RFC 5452 §9.2 asks for, minus
+/// `upstream_source_ports_exclude`. Unbound and PowerDNS use the same range.
+pub const SOURCE_PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
 
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -199,17 +205,44 @@ pub struct Config {
     /// never discarded: the limit is at least that timer plus 100 ms.
     pub udp_discard_timeout_ms: u64,
     pub upstream_hedge_ms: u64,
+    /// First window, in seconds, in which a failed resolution suppresses
+    /// matching outbound work (RFC 9520 section 3.2); repeats double it.
+    pub failure_cache_seconds: u64,
     pub upstream_strategy: UpstreamStrategy,
     pub upstream_timeout_seconds: u64,
     pub upstream_0x20: bool,
+    /// Source ports never used for plain upstream queries: each entry
+    /// is a port or an ascending `first-last` range (RFC 5452 §9.2).
+    pub upstream_source_ports_exclude: Vec<String>,
+    /// Parsed `upstream_source_ports_exclude`, filled by [`Config::validate`].
+    #[serde(skip)]
+    pub upstream_source_ports_excluded: Vec<(u16, u16)>,
     /// Opt-in: treat plain `fallback` servers as trusted primaries, lifting the
-    /// scrub of plaintext replies and the 300 s cap / no-stale rule for them.
-    /// Off by default; RFC 5452 checks apply either way.
+    /// reply scrub and the 300 s cap / no-stale rule for them. DoH replies are
+    /// always scrubbed. Off by default; RFC 5452 checks apply either way.
     pub trust_plain_upstreams: bool,
+    /// RFC 8375 §4: the authoritative server for `home.arpa`. Unset, the zone
+    /// is answered locally and never forwarded.
+    pub home_arpa_server: Option<SocketAddr>,
     /// RFC 6761 §6.2: forward `.test` names upstream instead of answering
     /// NXDOMAIN locally. Off by default.
     pub forward_test_names: bool,
     pub private_ptr: PrivatePtr,
+    /// RFC 6303 §3: local reverse zones forwarded one by one, by apex (for
+    /// example `"168.192.in-addr.arpa"`), whatever `private_ptr` says.
+    pub forward_reverse_zones: Vec<String>,
+    /// RFC 6303 empty zones: the SOA RNAME, and the TTL used for both the
+    /// record and the SOA MINIMUM. The defaults keep the historical output.
+    pub empty_zone_soa_rname: String,
+    /// Parsed `empty_zone_soa_rname`, filled by [`Config::validate`].
+    #[serde(skip)]
+    pub empty_zone_soa_rname_name: Name,
+    pub empty_zone_ttl: u32,
+    /// NS target for an empty zone; unset uses the zone apex, as before.
+    pub empty_zone_ns: Option<String>,
+    /// Parsed `empty_zone_ns`, filled by [`Config::validate`].
+    #[serde(skip)]
+    pub empty_zone_ns_name: Option<Name>,
     pub dnssec: DnssecMode,
     pub log_queries: bool,
     pub client_names: HashMap<String, String>,
@@ -273,17 +306,36 @@ impl Default for Config {
             upstream_inflight_per_client: 64,
             udp_discard_timeout_ms: 1900,
             upstream_hedge_ms: 50,
+            failure_cache_seconds: 5,
             upstream_strategy: UpstreamStrategy::Fastest,
             upstream_timeout_seconds: 5,
             upstream_0x20: true,
+            upstream_source_ports_exclude: Vec::new(),
+            upstream_source_ports_excluded: Vec::new(),
             trust_plain_upstreams: false,
+            home_arpa_server: None,
             forward_test_names: false,
             private_ptr: PrivatePtr::Nxdomain,
+            forward_reverse_zones: Vec::new(),
+            empty_zone_soa_rname: "nobody.invalid.".into(),
+            empty_zone_soa_rname_name: Name::from_ascii("nobody.invalid.").expect("static valid name"),
+            empty_zone_ttl: 10,
+            empty_zone_ns: None,
+            empty_zone_ns_name: None,
             dnssec: DnssecMode::Passthrough,
             log_queries: false,
             client_names: HashMap::new(),
         }
     }
+}
+
+/// One `upstream_source_ports_exclude` entry: a port or an ascending
+/// `first-last` range, both in 1..=65535.
+fn parse_source_port_range(entry: &str) -> Option<(u16, u16)> {
+    let (first, last) = entry.split_once('-').unwrap_or((entry, entry));
+    let first: u16 = first.parse().ok()?;
+    let last: u16 = last.parse().ok()?;
+    (first != 0 && first <= last).then_some((first, last))
 }
 
 impl Config {
@@ -314,6 +366,9 @@ impl Config {
             return Err(format!("listen must have 1..={MAX_LISTEN} addresses"));
         }
         for (i, addr) in self.listen.iter().enumerate() {
+            if addr.port() == 0 {
+                return Err(format!("listen address {addr} uses port 0; choose a fixed port"));
+            }
             if self.listen[..i].contains(addr) {
                 return Err(format!("duplicate listen address {addr}"));
             }
@@ -371,6 +426,22 @@ impl Config {
         if self.negative_ttl_min > self.negative_ttl_max {
             return Err("negative_ttl_min must not exceed negative_ttl_max".into());
         }
+        if self.empty_zone_soa_rname.is_empty() {
+            return Err("empty_zone_soa_rname must be a valid DNS name".into());
+        }
+        self.empty_zone_soa_rname_name = Name::from_ascii(&self.empty_zone_soa_rname)
+            .map_err(|_| "empty_zone_soa_rname must be a valid DNS name".to_string())?;
+        self.empty_zone_ns_name = match self.empty_zone_ns.as_deref() {
+            Some("") => return Err("empty_zone_ns must be a valid DNS name".into()),
+            Some(name) => {
+                Some(Name::from_ascii(name).map_err(|_| "empty_zone_ns must be a valid DNS name".to_string())?)
+            }
+            None => None,
+        };
+        // RFC 2181 §8: a TTL is a 31-bit unsigned value.
+        if self.empty_zone_ttl > i32::MAX as u32 {
+            return Err("empty_zone_ttl must be in 0..=2147483647".into());
+        }
         if self.tcp_idle_timeout_seconds == 0 {
             return Err("tcp_idle_timeout_seconds must be greater than zero".into());
         }
@@ -391,8 +462,19 @@ impl Config {
         if self.tcp_pipeline_max == 0 || self.tcp_pipeline_max > 256 {
             return Err("tcp_pipeline_max must be between 1 and 256".into());
         }
+        // RFC 9715 §3.1: a UDP responder should compose responses no larger
+        // than the RECOMMENDED 1400-byte DNS/UDP payload. 1.0.0 accepted
+        // larger values, so they are lowered with a warning, not rejected.
         if self.udp_max_payload < 512 {
             return Err("udp_max_payload must be at least 512".into());
+        }
+        if self.udp_max_payload > 1400 {
+            crate::log::log(
+                "warn",
+                "udp_max_payload_lowered",
+                &[("configured", self.udp_max_payload.to_string()), ("used", "1400".into())],
+            );
+            self.udp_max_payload = 1400;
         }
         // 0 disables the query log; 112 bytes per entry bounds this at 112 MB.
         if self.query_log_capacity > 1_000_000 {
@@ -403,7 +485,7 @@ impl Config {
             return Err("udp_workers must be in 0..=64".into());
         }
         // 0 keeps one datagram per wake. The upper bound also bounds the
-        // per-worker receive buffer set (32 x 4096 = 128 KiB).
+        // per-worker receive buffer set (32 x 64 KiB = 2 MiB of address space).
         if self.udp_batch > MAX_UDP_BATCH {
             return Err(format!("udp_batch must be in 0..={MAX_UDP_BATCH}"));
         }
@@ -433,9 +515,73 @@ impl Config {
         if self.udp_discard_timeout_ms > 60_000 {
             return Err("udp_discard_timeout_ms must be between 0 and 60000".into());
         }
+        if !(1..=300).contains(&self.failure_cache_seconds) {
+            return Err("failure_cache_seconds must be between 1 and 300".into());
+        }
+        // Each entry must name the apex of one of the local reverse zones;
+        // shared CGN space stays local (RFC 6598 §4).
+        for zone in &mut self.forward_reverse_zones {
+            *zone = zone.trim_end_matches('.').to_ascii_lowercase();
+            let apex = crate::reverse::zone_for(zone).filter(|found| {
+                found.kind == crate::reverse::ZoneKind::Reverse && found.is_apex && found.apex == *zone
+            });
+            if apex.is_none() || zone.ends_with(".100.in-addr.arpa") {
+                return Err(format!(
+                    "forward_reverse_zones entry {zone:?} is not the apex of a local reverse zone that may be forwarded"
+                ));
+            }
+        }
         if self.upstream_hedge_ms > 5000 {
             return Err("upstream_hedge_ms must be at most 5000".into());
         }
+        // Plain upstream queries leave from a random port in SOURCE_PORTS, so
+        // the exclusion list must leave one to pick.
+        // Overlapping and adjacent entries are merged, so the query path only
+        // counts disjoint ranges.
+        let mut ranges = Vec::with_capacity(self.upstream_source_ports_exclude.len());
+        for (index, entry) in self.upstream_source_ports_exclude.iter().enumerate() {
+            let range = parse_source_port_range(entry).ok_or_else(|| {
+                format!(
+                    "upstream_source_ports_exclude entry {}: expected a port 1..=65535 or an ascending range such as 49152-49200",
+                    index + 1
+                )
+            })?;
+            ranges.push(range);
+        }
+        // Our own listen ports are never a source port, so a reload or
+        // restart can always bind them again.
+        ranges.extend(
+            self.listen
+                .iter()
+                .chain([&self.ui_listen])
+                .map(SocketAddr::port)
+                .filter(|port| SOURCE_PORTS.contains(port))
+                .map(|port| (port, port)),
+        );
+        ranges.sort_unstable();
+        let mut merged: Vec<(u16, u16)> = Vec::with_capacity(ranges.len());
+        for (first, last) in ranges {
+            match merged.last_mut() {
+                Some((_, last_merged)) if first <= last_merged.saturating_add(1) => {
+                    *last_merged = (*last_merged).max(last);
+                }
+                _ => merged.push((first, last)),
+            }
+        }
+        let mut next_port = u32::from(*SOURCE_PORTS.start());
+        for &(first, last) in &merged {
+            if u32::from(last) < next_port {
+                continue;
+            }
+            if u32::from(first) > next_port {
+                break;
+            }
+            next_port = u32::from(last) + 1;
+        }
+        if next_port > u32::from(*SOURCE_PORTS.end()) {
+            return Err("upstream_source_ports_exclude must leave at least one port in 1024..=65535".into());
+        }
+        self.upstream_source_ports_excluded = merged;
         // A stale client wait is per request and holds a client slot. This is
         // the configured ceiling; the effective wait at request time is also
         // capped by the upstream deadline (`upstream_timeout_seconds`).
@@ -845,9 +991,16 @@ mod tests {
         assert_eq!(c.upstream_strategy, UpstreamStrategy::Fastest);
         assert_eq!(c.upstream_timeout_seconds, 5);
         assert!(c.upstream_0x20);
+        assert!(c.upstream_source_ports_exclude.is_empty());
+        assert!(c.upstream_source_ports_excluded.is_empty());
         assert!(!c.trust_plain_upstreams);
         assert!(!c.forward_test_names);
         assert_eq!(c.private_ptr, PrivatePtr::Nxdomain);
+        assert_eq!(c.empty_zone_soa_rname, "nobody.invalid.");
+        assert_eq!(c.empty_zone_soa_rname_name.to_ascii(), "nobody.invalid.");
+        assert_eq!(c.empty_zone_ttl, 10);
+        assert!(c.empty_zone_ns.is_none(), "the NS target defaults to the zone apex");
+        assert!(c.empty_zone_ns_name.is_none());
         assert_eq!(c.dnssec, DnssecMode::Passthrough);
         assert!(!c.log_queries);
         assert!(c.client_names.is_empty());
@@ -1165,6 +1318,12 @@ cache_bytes = 0
         assert!(c.validate().is_err());
         let mut c = Config { upstream_timeout_seconds: 60, ..Config::default() };
         assert!(c.validate().is_ok());
+        for bad in [0, 301] {
+            let mut c = Config { failure_cache_seconds: bad, ..Config::default() };
+            assert!(c.validate().is_err(), "{bad}");
+        }
+        let mut c = Config { failure_cache_seconds: 300, ..Config::default() };
+        c.validate().unwrap();
         let mut c = Config { upstream_hedge_ms: 5001, ..Config::default() };
         assert!(c.validate().is_err());
         for max in [0, 65_537] {
@@ -1211,6 +1370,89 @@ cache_bytes = 0
         }
     }
 
+    /// RFC 9715 section 3.1: UDP responders should compose replies no larger
+    /// than the RECOMMENDED 1400-byte DNS/UDP payload.
+    #[test]
+    fn udp_max_payload_never_exceeds_the_rfc_9715_recommendation() {
+        let mut c = Config { udp_max_payload: 1400, ..Config::default() };
+        c.validate().unwrap();
+        let mut c = Config { udp_max_payload: 4096, ..Config::default() };
+        c.validate().expect("a 1.0.0 value above 1400 still loads");
+        assert_eq!(c.udp_max_payload, 1400, "and is lowered to the RFC 9715 ceiling");
+    }
+
+    /// RFC 6303 empty zones: the RNAME and NS override must parse, and the TTL
+    /// is an RFC 2181 31-bit value.
+    #[test]
+    fn empty_zone_keys_are_validated_and_parsed() {
+        let mut c: Config = toml::from_str(
+            "empty_zone_soa_rname = \"hostmaster.example.\"\nempty_zone_ns = \"ns.example.\"\nempty_zone_ttl = 300",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.empty_zone_soa_rname_name.to_ascii(), "hostmaster.example.");
+        assert_eq!(c.empty_zone_ns_name.as_ref().unwrap().to_ascii(), "ns.example.");
+        assert_eq!(c.empty_zone_ttl, 300);
+
+        for bad in ["", "bad name", "a..b"] {
+            let mut c = Config { empty_zone_soa_rname: bad.into(), ..Config::default() };
+            assert_eq!(c.validate().unwrap_err(), "empty_zone_soa_rname must be a valid DNS name", "{bad:?}");
+            let mut c = Config { empty_zone_ns: Some(bad.into()), ..Config::default() };
+            assert_eq!(c.validate().unwrap_err(), "empty_zone_ns must be a valid DNS name", "{bad:?}");
+        }
+        for ttl in [0, i32::MAX as u32] {
+            let mut c = Config { empty_zone_ttl: ttl, ..Config::default() };
+            assert!(c.validate().is_ok(), "empty_zone_ttl = {ttl} must be accepted");
+        }
+        let mut c = Config { empty_zone_ttl: i32::MAX as u32 + 1, ..Config::default() };
+        assert_eq!(c.validate().unwrap_err(), "empty_zone_ttl must be in 0..=2147483647");
+    }
+
+    #[test]
+    fn upstream_source_port_exclusions_parse_and_must_leave_a_port() {
+        let mut ok: Config = toml::from_str("upstream_source_ports_exclude = [\"49152-49200\", \"5353\"]").unwrap();
+        ok.validate().unwrap();
+        // The UI port (9999 by default) is always excluded; port 53 is below the range.
+        assert_eq!(ok.upstream_source_ports_excluded, vec![(5353, 5353), (9999, 9999), (49152, 49200)]);
+        // Overlapping and adjacent entries are merged for the query path.
+        let mut merged: Config =
+            toml::from_str("upstream_source_ports_exclude = [\"49152-50000\", \"49500-50010\", \"50011\"]").unwrap();
+        merged.validate().unwrap();
+        assert_eq!(merged.upstream_source_ports_excluded, vec![(9999, 9999), (49152, 50011)]);
+        for entries in [
+            vec!["1".to_string()],
+            vec!["49152".to_string()],
+            vec!["65535".to_string()],
+            vec!["49152-65535".to_string()],
+            vec!["1-65534".to_string()],
+            vec!["1-49151".to_string(), "49153-65535".to_string()],
+        ] {
+            let mut c = Config { upstream_source_ports_exclude: entries, ..Config::default() };
+            assert!(c.validate().is_ok(), "{:?}", c.upstream_source_ports_exclude);
+        }
+        // Malformed entries: out of range, zero, descending, too many parts,
+        // not a number.
+        for entry in ["", "0", "65536", "49152-", "-1", "100-50", "1-2-3", "5353d", "49152 - 49200"] {
+            let mut c = Config { upstream_source_ports_exclude: vec![entry.into()], ..Config::default() };
+            let error = c.validate().unwrap_err();
+            assert!(error.starts_with("upstream_source_ports_exclude entry 1:"), "{entry:?}: {error}");
+        }
+        // Excluding every port from 1024 up, in one range or split and
+        // overlapping ones, leaves the query path nothing to choose from.
+        for entries in [
+            vec!["1024-65535".to_string()],
+            vec!["1-65535".to_string()],
+            vec!["1024-60000".to_string(), "60001-65535".to_string()],
+            vec!["1-65535".to_string(), "50000-50010".to_string()],
+        ] {
+            let mut c = Config { upstream_source_ports_exclude: entries, ..Config::default() };
+            assert_eq!(
+                c.validate().unwrap_err(),
+                "upstream_source_ports_exclude must leave at least one port in 1024..=65535"
+            );
+        }
+    }
+
     #[test]
     fn listen_accepts_a_string_or_an_array_and_validates_the_list() {
         let one: Config = toml::from_str("listen = \"127.0.0.1:5353\"").unwrap();
@@ -1229,6 +1471,14 @@ cache_bytes = 0
         assert!(over.validate().is_err());
         assert!(toml::from_str::<Config>("listen = [\"nonsense\"]").is_err());
         assert!(toml::from_str::<Config>("listen = 53").is_err());
+    }
+
+    /// RFC 8085 section 5.1: a UDP receiver should not bind to port zero.
+    #[test]
+    fn listen_rejects_port_zero() {
+        let mut c: Config = toml::from_str("listen = [\"127.0.0.1:53\", \"[::1]:0\"]").unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("port 0") && err.contains("[::1]:0"), "{err}");
     }
 
     #[test]

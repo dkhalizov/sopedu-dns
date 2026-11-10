@@ -1,7 +1,8 @@
 # Competitor benchmark
 
 sopedu-dns against AdGuard Home, Pi-hole and Blocky with the same resource
-limits, blocklists, upstream and client.
+limits, blocklists, upstream and client. On k3s, Numa runs with the same lists,
+and Unbound and dnsmasq run as unfiltered reference servers.
 
 ## What is held equal
 
@@ -14,8 +15,8 @@ limits, blocklists, upstream and client.
 | sopedu source | built from `git archive $SOPEDU_REF` (default `HEAD`) into `.run/src`, never the working tree; the results print the commit |
 | Memory | cgroup v2 `memory.peak` of the container/Pod plus max `VmHWM` / sum `VmRSS` of its processes. Not `docker stats` working set |
 
-Cache sizes are each product's default (sopedu 20k entries / 8 MiB, AGH
-8 MiB, Blocky 20k items, Pi-hole 10k). Each one holds the whole hot set.
+Cache sizes are set to hold the whole hot set (sopedu 20k entries / 8 MiB,
+AGH 8 MiB, Blocky 20k items, Pi-hole 10k).
 
 ## Phases (`phases.sh`, same for Docker and k3s)
 
@@ -27,7 +28,8 @@ Cache sizes are each product's default (sopedu 20k entries / 8 MiB, AGH
 | `blocked` | open loop `-Q 500`, 5,000 list rules | blocked answer with the four lists loaded (~516k unique rules) |
 | `hit-50/500/5000` | open loop `-Q`, every distinct corpus name, primed | hit latency at home, busy and stress rates |
 | `sat-udp-N`, `sat-tcp` | closed loop, `OUTSTANDING` in flight, whole corpus | saturation qps. The shared lists block about 29% of the corpus, so this is cache hits plus rule blocks |
-| `sat-allowed-N` | same, only corpus names the lists do not block (`hot-allowed.txt`, derived once from sopedu's NXDOMAINs) | pure cache hits; the stream to compare the unfiltered reference servers on |
+| `sat-allowed-N` | same, only corpus names the lists do not block (`hot-allowed.txt`, derived once from sopedu's NXDOMAINs) | cache hits, except HTTPS names that dnsmasq and Pi-hole don't cache in this setup; the stream to compare the unfiltered reference servers on |
+| `sat-cacheable-N` | same, only unblocked A/AAAA names (`hot-cacheable.txt`) | pure cache hits on every server |
 | `sat-allowed-x2` (`TWO_CLIENTS=1`) | two dnsperf processes at once, qps summed | checks whether the client is the limit |
 | `mem-idle`, `mem-peak` | none | memory as above |
 
@@ -47,14 +49,18 @@ Reference servers (k3s only):
 
 - `unbound`: forwarder, 1 thread, cache on, no blocking.
 - `dnsmasq`: cache on, no blocklists, no log.
-- `pihole-lean`: Pi-hole with the query log, database and per-query storage off.
+- `pihole-lean`: Pi-hole with the query log, database and per-query storage off,
+  and a 256 MiB `/dev/shm` (FTL keeps every query there, and the 64 MiB default
+  fills after about a million queries).
 
-`unbound` and `dnsmasq` are neutral baselines. dnsmasq (and so Pi-hole)
-caches at most 10,000 names: fewer than the 12.7k-name corpus, more than the
-~9k unblocked names of `sat-allowed`. Build the reference image with
+`unbound` and `dnsmasq` are neutral baselines. dnsmasq is set to 20,000
+names and Pi-hole to 10,000 (fewer than the 12.7k-name corpus, more than the
+~9k unblocked names of `sat-allowed`). Neither caches HTTPS records here:
+dnsmasq 2.90 and later can with `--cache-rr`, which these configs don't set. Build the reference image with
 `k8s/Dockerfile.ref` (`ref-bench:amd64`, imported on the server node). The
 dnsperf Pod is limited to 2 CPUs. Everything runs in its own namespace (`NS`,
-default `sopedu-bench`), which the script creates and deletes.
+default `sopedu-bench`). The script creates it if needed and deletes it
+afterwards only if it created it.
 
 ## Docker (any Linux host)
 
@@ -72,8 +78,6 @@ is running or `PORT` (15353) is busy. Results go to
 `results/<stamp>.{tsv,md}` (gitignored).
 
 ## k3s
-
-Nothing here touches a cluster until you run it.
 
 One-time image imports (amd64 nodes):
 

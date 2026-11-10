@@ -76,7 +76,7 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: sopedu-dns
-          image: ghcr.io/dkhalizov/sopedu-dns:1.0.0
+          image: ghcr.io/dkhalizov/sopedu-dns:1.1.0
           imagePullPolicy: IfNotPresent
           # Port 53 needs CAP_NET_BIND_SERVICE. Kubernetes gives non-root
           # processes no ambient capabilities, and

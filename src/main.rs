@@ -246,6 +246,9 @@ struct Server {
     /// Conformance adapter: UDP datagram lifecycle counters.
     #[cfg(feature = "conformance-adapter")]
     packets: adapter::Packets,
+    /// The UDP slow-path permits and their total, set once the listeners
+    /// start; `/metrics` reports the permits in use.
+    udp_permits: std::sync::OnceLock<(Arc<Semaphore>, usize)>,
     /// Wakes the list refresher after a reload changed list configuration or
     /// `refresh_hours`.
     refresh_now: Notify,
@@ -338,6 +341,24 @@ impl Server {
         out.push_str(&format!("dns_cache_entries {entries}\n"));
         out.push_str("# HELP dns_cache_bytes Bytes charged to the response cache.\n# TYPE dns_cache_bytes gauge\n");
         out.push_str(&format!("dns_cache_bytes {bytes}\n"));
+        let upstream = runtime.cfg.upstream_inflight_max.max(1).saturating_sub(runtime.upstreams.inflight_available());
+        out.push_str(
+            "# HELP dns_upstream_inflight Upstream exchanges in flight.\n# TYPE dns_upstream_inflight gauge\n",
+        );
+        out.push_str(&format!("dns_upstream_inflight {upstream}\n"));
+        let udp = self.udp_permits.get().map_or(0, |(permits, max)| max.saturating_sub(permits.available_permits()));
+        out.push_str("# HELP dns_udp_inflight UDP requests on the slow path.\n# TYPE dns_udp_inflight gauge\n");
+        out.push_str(&format!("dns_udp_inflight {udp}\n"));
+        {
+            use lists::observed::{LIMIT_BYTES, PEAK_BYTES, REJECTED_OVERSIZE};
+            use std::sync::atomic::Ordering::Relaxed;
+            out.push_str("# HELP dns_blocklist_rejected_oversize_total Lists stopped by a size or line bound while streaming.\n# TYPE dns_blocklist_rejected_oversize_total counter\n");
+            out.push_str(&format!("dns_blocklist_rejected_oversize_total {}\n", REJECTED_OVERSIZE.load(Relaxed)));
+            out.push_str("# HELP dns_blocklist_buffer_peak_bytes Largest list parse buffer held.\n# TYPE dns_blocklist_buffer_peak_bytes gauge\n");
+            out.push_str(&format!("dns_blocklist_buffer_peak_bytes {}\n", PEAK_BYTES.load(Relaxed)));
+            out.push_str("# HELP dns_blocklist_buffer_limit_bytes The list size bound in force (blocklist_max_bytes).\n# TYPE dns_blocklist_buffer_limit_bytes gauge\n");
+            out.push_str(&format!("dns_blocklist_buffer_limit_bytes {}\n", LIMIT_BYTES.load(Relaxed)));
+        }
         out.push_str(
             "# HELP dns_blocklist_rules Rules loaded from each blocklist.\n# TYPE dns_blocklist_rules gauge\n",
         );
@@ -438,24 +459,24 @@ fn soa(m: &mut Message, name: Name) {
     ));
 }
 /// Authoritative negative SOA for a synthetic local zone: owner and MNAME are
-/// the zone apex, RNAME `nobody.invalid.`, TTL/MINIMUM 10.
-fn zone_soa(zone: &Name) -> Record {
-    let rname = Name::from_ascii("nobody.invalid.").expect("static valid name");
-    Record::from_rdata(zone.clone(), 10, RData::SOA(SOA::new(zone.clone(), rname, 1, 3600, 600, 86400, 10)))
+/// the zone apex, RNAME and TTL/MINIMUM come from the `empty_zone_*` keys
+/// (default RNAME `nobody.invalid.`, TTL 10).
+fn zone_soa(cfg: &Config, zone: &Name) -> Record {
+    let soa = SOA::new(zone.clone(), cfg.empty_zone_soa_rname_name.clone(), 1, 3600, 600, 86400, cfg.empty_zone_ttl);
+    Record::from_rdata(zone.clone(), cfg.empty_zone_ttl, RData::SOA(soa))
 }
-/// Synthetic apex NS: the target is the zone apex itself.
-fn zone_ns(zone: &Name) -> Record {
-    Record::from_rdata(zone.clone(), 10, RData::NS(NS(zone.clone())))
+/// Synthetic apex NS: the target is `empty_zone_ns`, or the zone apex itself.
+fn zone_ns(cfg: &Config, zone: &Name) -> Record {
+    let target = cfg.empty_zone_ns_name.clone().unwrap_or_else(|| zone.clone());
+    Record::from_rdata(zone.clone(), cfg.empty_zone_ttl, RData::NS(NS(target)))
 }
 /// Local answer for a private reverse name or a local empty zone. `None` means
-/// "not local, forward it": a public reverse name, a PTR with
+/// "not local, forward it": a public reverse name, a reverse name with
 /// `private_ptr = "forward"`, or the DS probe at a local zone apex with DO=1.
 fn reverse_answer(cfg: &Config, q: &Message, name: &str, do_bit: bool) -> Option<Message> {
     let query = q.queries.first()?;
     let qtype = query.query_type();
-    // `forward` opts the whole private PTR path out, including zone-service
-    // PTR answers; SOA/NS and negative zone answers stay local.
-    if reverse::forwards_ptr(cfg, u16::from(qtype), name) {
+    if reverse::forwards_reverse(cfg, u16::from(qtype), name) || reverse::forwards_home(cfg, name) {
         return None;
     }
     let zone = reverse::zone_for(name);
@@ -486,9 +507,9 @@ fn reverse_answer(cfg: &Config, q: &Message, name: &str, do_bit: bool) -> Option
     local.metadata.authoritative = true;
     if zone.is_apex {
         match qtype {
-            RecordType::SOA => local.add_answer(zone_soa(&apex)),
-            RecordType::NS => local.add_answer(zone_ns(&apex)),
-            _ => local.add_authority(zone_soa(&apex)),
+            RecordType::SOA => local.add_answer(zone_soa(cfg, &apex)),
+            RecordType::NS => local.add_answer(zone_ns(cfg, &apex)),
+            _ => local.add_authority(zone_soa(cfg, &apex)),
         };
         Some(local)
     } else {
@@ -496,7 +517,7 @@ fn reverse_answer(cfg: &Config, q: &Message, name: &str, do_bit: bool) -> Option
         if zone.kind != reverse::ZoneKind::NoData {
             local.metadata.response_code = ResponseCode::NXDomain;
         }
-        local.add_authority(zone_soa(&apex));
+        local.add_authority(zone_soa(cfg, &apex));
         Some(local)
     }
 }
@@ -633,7 +654,7 @@ impl DnssecContext {
 /// Where the local policy answered a query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
-    /// CHAOS class, QCLASS ANY or NONE, or a `version.bind`-style name: REFUSED.
+    /// A `version.bind`-style server-identity name: REFUSED.
     Chaos,
     /// A non-QUERY opcode: NOTIMP.
     NotImp,
@@ -696,9 +717,7 @@ impl Runtime {
         // Built only by the branches that answer locally: a forwarded miss
         // (the common case) must not pay for a Message and a query clone.
         let local = || reply(q, ResponseCode::NoError);
-        if query.query_class() == DNSClass::CH
-            || matches!(name.as_str(), "version.bind" | "id.server" | "hostname.bind")
-        {
+        if matches!(name.as_str(), "version.bind" | "id.server" | "hostname.bind") {
             let mut local = local();
             local.metadata.response_code = ResponseCode::Refused;
             return Some(Local { stage: Stage::Chaos, answer: local });
@@ -710,21 +729,10 @@ impl Runtime {
         }
         // ANY is never forwarded. It goes through the local policy below like
         // any type (a blocked or special-use name keeps its answer) and gets
-        // the RFC 8482 HINFO where the policy would otherwise forward.
-        // QCLASS ANY and NONE (RFC 6895 §3.2: query classes, not data
-        // classes) are never forwarded either: an upstream answers them from
-        // its IN data, which this server would then serve for another class.
-        let forward = || {
-            if query.query_type() == RecordType::ANY {
-                Some(Local { stage: Stage::Any, answer: any_hinfo(q) })
-            } else if matches!(query.query_class(), DNSClass::ANY | DNSClass::NONE) {
-                let mut local = local();
-                local.metadata.response_code = ResponseCode::Refused;
-                Some(Local { stage: Stage::Chaos, answer: local })
-            } else {
-                None
-            }
-        };
+        // the RFC 8482 HINFO where the policy would otherwise forward. Every
+        // other QTYPE and QCLASS is proxied (RFC 5625 §4.3); only IN is cached.
+        let forward =
+            || (query.query_type() == RecordType::ANY).then(|| Local { stage: Stage::Any, answer: any_hinfo(q) });
         let is_in = query.query_class() == DNSClass::IN;
         if let Some(ip) = rules::rewrite(&self.cfg.rewrites, &name) {
             // Another class gets NODATA: the name is local, but the
@@ -782,6 +790,38 @@ const ANY_HINFO_TTL: u32 = 10;
 
 /// The class of a locally built record: the question's, or IN for QCLASS ANY
 /// or NONE, which are not data classes (RFC 6895 §3.2).
+/// For an NXDOMAIN whose Answer is a CNAME chain, the name-level cache key and
+/// the denial of the chain's last name (RFC 8020 §2): the question names it,
+/// no Answer, the Authority kept. `key` is the question's cache key.
+fn terminal_name_error(key: &[u8], message: &Message) -> Option<(Vec<u8>, Message)> {
+    let mut name = message.queries.first()?.name().to_lowercase();
+    // Each step consumes a record, so a loop cannot outlast the Answer.
+    for _ in 0..message.answers.len() {
+        let next = message.answers.iter().find_map(|record| match &record.data {
+            RData::CNAME(target) if record.name.to_lowercase() == name => Some(target.0.to_lowercase()),
+            _ => None,
+        });
+        match next {
+            Some(target) if target != name => name = target,
+            _ => break,
+        }
+    }
+    if name == message.queries[0].name().to_lowercase() {
+        return None;
+    }
+    // The cache stores it only under an SOA of the zone holding `name`
+    // (cache::negative_ttl), so one reply cannot deny an unrelated name.
+    let mut denial = message.clone();
+    denial.queries[0].set_name(name.clone());
+    denial.answers.clear();
+    // The question key's class and flags byte, behind the new name.
+    let tail = key.len().checked_sub(5)?;
+    let mut name_key = hickory_proto::serialize::binary::BinEncodable::to_bytes(&name).ok()?;
+    name_key.extend_from_slice(&key[tail..]);
+    wire::name_error_key(&mut name_key);
+    Some((name_key, denial))
+}
+
 fn data_class(class: DNSClass) -> DNSClass {
     match class {
         DNSClass::ANY | DNSClass::NONE => DNSClass::IN,
@@ -851,10 +891,10 @@ impl Runtime {
         let qtype_code = u16::from(qtype);
         let gate = if client.is_some_and(|ip| !self.cfg.client_allowed(ip)) {
             Some(("REFUSED", "The client is outside allowed_clients, so the server answers REFUSED without a lookup."))
-        } else if wire::TRANSFER_TYPES.contains(&qtype_code) {
-            Some(("REFUSED", "Zone transfers and TKEY are refused."))
-        } else if wire::is_meta_qtype(qtype_code) {
-            Some(("FORMERR", "Meta query types are rejected as malformed."))
+        } else if qtype_code == wire::AXFR_TYPE {
+            Some(("REFUSED", "AXFR is refused over UDP. Over TCP it goes to a plain fallback server."))
+        } else if wire::is_invalid_qtype(qtype_code) {
+            Some(("FORMERR", "NXNAME is not a valid query type."))
         } else {
             None
         };
@@ -909,7 +949,7 @@ impl Runtime {
             (_, false) => format!("{rcode} {}", addresses.join(", ")),
         };
         let (verdict, class, detail) = match local.stage {
-            Stage::Chaos => ("Refused", "warn", "CHAOS-class and server-identity names are refused.".to_string()),
+            Stage::Chaos => ("Refused", "warn", "Server-identity names are refused.".to_string()),
             Stage::NotImp => ("Not implemented", "warn", "Only the QUERY opcode is implemented.".to_string()),
             Stage::Any => (
                 "Minimal ANY answer",
@@ -997,6 +1037,12 @@ impl Runtime {
         // lines up with the parsed message.
         wire::cap_ttls(&mut relayed);
         wire::normalize_rrset_ttls(&message, &mut relayed);
+        // Conservative AD profile (RFC 6840 §5.8): only a client that set AD
+        // or DO gets AD, on this relay and on fresh hits of its cache variant
+        // (the key carries both bits). Plain replies arrive with AD cleared.
+        if !client.ad_ok {
+            wire::clear_ad(&mut relayed);
+        }
         // Plaintext answers are short-lived and never served stale unless the
         // operator opted in to trusting plain servers (`trust_plain_upstreams`).
         let downgraded = answer.upstream_index.is_none() && !self.cfg.trust_plain_upstreams;
@@ -1013,6 +1059,37 @@ impl Runtime {
                 } else {
                     None
                 };
+                // RFC 2308 §8: the name itself does not exist, so this holds for
+                // every QTYPE. An Answer means the denial is of an alias target.
+                // First, because storing an NXDOMAIN clears the name's other
+                // QTYPE entries, which this key is not one of.
+                if message.metadata.response_code == ResponseCode::NXDomain && message.answers.is_empty() {
+                    let mut name_key = key.to_vec();
+                    wire::name_error_key(&mut name_key);
+                    self.cache.insert_with_chain(&name_key, &relayed, &message, answer.age, downgraded, None);
+                } else if message.metadata.response_code == ResponseCode::NXDomain
+                    && !downgraded
+                    && !wire::parse_query(raw).is_some_and(|view| wire::is_home_arpa_query(&view))
+                {
+                    // RFC 8020 §2: the denied name is the last of the chain,
+                    // so its name-level entry answers it directly. Only a
+                    // source trusted for any name may deny one other than
+                    // the question: an authenticated DoH upstream, or plain
+                    // servers the operator trusts. A spoofable plain reply,
+                    // or a home_arpa_server reply (it speaks for home.arpa
+                    // only), never denies a different name.
+                    if let Some((name_key, denial)) = terminal_name_error(key, &message) {
+                        if let Ok(mut bytes) = denial.to_vec() {
+                            // The denial is rebuilt from the parsed upstream
+                            // message: it carries exactly the AD of the relayed
+                            // answer, which the client profile already decided.
+                            if wire::header(&relayed).is_none_or(|head| head.flags & 0x0020 == 0) {
+                                wire::clear_ad(&mut bytes);
+                            }
+                            self.cache.insert_with_chain(&name_key, &bytes, &denial, answer.age, downgraded, None);
+                        }
+                    }
+                }
                 let stored = self.cache.insert_with_chain(key, &relayed, &message, answer.age, downgraded, chain);
                 if !stored {
                     // The newer answer supersedes a stale copy it cannot replace.
@@ -1049,9 +1126,6 @@ impl Runtime {
                     relayed[at..at + 4].copy_from_slice(&capped.to_be_bytes());
                 }
             }
-        }
-        if !client.ad_ok {
-            wire::clear_ad(&mut relayed);
         }
         Some(relayed)
     }
@@ -1175,6 +1249,7 @@ impl Runtime {
         // EDNS flag cannot share this cache key. Only IN is cached or
         // shared; other classes are forwarded separately.
         let cacheable = view.qclass == u16::from(DNSClass::IN)
+            && !wire::is_meta_qtype(view.qtype)
             && !view.signed
             && !view.has_answer_or_authority
             && !view.has_non_opt_additional
@@ -1191,8 +1266,37 @@ impl Runtime {
         match self.cache.get_into(&key[..len], view.id, self.max_age, answer) {
             // Do not send an unsolicited OPT to a non-EDNS client.
             Some(meta) if meta.had_edns == view.edns_present => CacheLookup::Hit(len, meta),
-            _ => CacheLookup::Miss(len),
+            _ => {
+                self.name_error_hit(view, key, len, answer).map_or(CacheLookup::Miss(len), |m| CacheLookup::Hit(len, m))
+            }
         }
+    }
+
+    /// True when name policy would answer this query itself. A message proxied
+    /// unchanged stops here: a signature does not get a name past the
+    /// blocklist or a local zone, and an unsigned local answer would fail the
+    /// client's check anyway.
+    fn answers_locally(&self, raw: &[u8], ip: IpAddr) -> bool {
+        wire::upstream_query(raw).and_then(|query| parse(&query)).is_none_or(|q| self.policy(&q, false, ip).is_some())
+    }
+
+    /// RFC 2308 §8: a fresh NXDOMAIN for the name answers any QTYPE. A stale
+    /// one does not: its refresh belongs to the question that stored it.
+    fn name_error_hit(
+        &self,
+        view: &wire::QueryView<'_>,
+        key: &[u8; wire::MIN_CANONICAL_BUFFER],
+        len: usize,
+        answer: &mut Vec<u8>,
+    ) -> Option<cache::HitMeta> {
+        let mut name_key = *key;
+        wire::name_error_key(&mut name_key[..len]);
+        let meta = self.cache.get_into(&name_key[..len], view.id, self.max_age, answer)?;
+        if meta.stale || meta.had_edns != view.edns_present {
+            return None;
+        }
+        wire::set_question_type(answer, view)?;
+        Some(meta)
     }
 
     /// Prefetch (Unbound style): refresh a popular positive entry during the last
@@ -1333,7 +1437,7 @@ impl Runtime {
             return InlineHit::Inline(answer.len());
         }
         // RFC 8914 §3: drop EDE options before other answer data.
-        if wire::drop_ede_to_fit(answer, limit, scratch) {
+        if wire::drop_ede_to_fit(answer, limit, scratch) || wire::drop_additional_to_fit(answer, limit, scratch) {
             return InlineHit::Truncated(scratch.len());
         }
         match wire::truncated_response_into(view, answer, self.cfg.udp_max_payload, scratch) {
@@ -1721,16 +1825,46 @@ impl Server {
         if view.edns_bad_ecs {
             return refuse(ResponseCode::FormErr);
         }
-        if view.signed || wire::TRANSFER_TYPES.contains(&view.qtype) {
-            // TSIG/SIG(0) needs an authentication boundary we do not implement;
-            // zone transfers and TKEY are not part of a forwarder's job.
-            return refuse(ResponseCode::Refused);
-        }
-        if view.opcode != u8::from(OpCode::Query) {
-            return refuse(ResponseCode::NotImp);
-        }
-        if wire::is_meta_qtype(view.qtype) {
+        // The NXNAME rule precedes verbatim proxying: RFC 9824 §3.5 says a
+        // resolver MUST NOT forward an explicit NXNAME query. The opcode rule
+        // already ran on the header above.
+        if wire::is_invalid_qtype(view.qtype) {
             return refuse(ResponseCode::FormErr);
+        }
+        if view.signed || wire::TRANSFER_TYPES.contains(&view.qtype) {
+            // RFC 5936 §4.2 defines no AXFR over UDP, and over TCP `serve_tcp`
+            // streams it before it gets here.
+            if view.qtype == wire::AXFR_TYPE || runtime.answers_locally(raw, ip) {
+                return refuse(ResponseCode::Refused);
+            }
+            // The per-host cap of a cache miss applies here too, so one host
+            // sending signed queries cannot take every upstream slot. Over
+            // UDP the source may be forged: TC=1 (rate limited) sends a real
+            // client to TCP instead of a SERVFAIL aimed at a victim.
+            let Some(_slot) = runtime.upstream_slot(ip) else {
+                if !udp {
+                    return refuse(ResponseCode::ServFail);
+                }
+                if !runtime.capped_replies.allow(ip, Instant::now()) {
+                    stats::count(Outcome::Dropped);
+                    return None;
+                }
+                stats::count(Outcome::Other);
+                return wire::truncated_response(&view, raw, runtime.cfg.udp_max_payload);
+            };
+            let Some(answer) = runtime.upstreams.exchange_verbatim(raw, !udp).await else {
+                return refuse(ResponseCode::ServFail);
+            };
+            stats::count(Outcome::Upstream);
+            // A DoH reply is not bound by the client's UDP size. Trimming would
+            // break a signature, so an oversized one is TC only and the client
+            // retries over TCP (RFC 5625 §4.4 MUST set TC on truncation).
+            let limit =
+                if view.edns_present { view.edns_payload.max(512).min(runtime.cfg.udp_max_payload) } else { 512 };
+            if udp && answer.len() > usize::from(limit) {
+                return wire::truncated_response(&view, &answer, runtime.cfg.udp_max_payload);
+            }
+            return Some(answer);
         }
         // A fresh or stale cache hit is answered from the wire view alone;
         // hickory only ever runs on the slow path. Admission and logging are
@@ -1761,7 +1895,9 @@ impl Server {
                 // RFC 8914 §3: drop EDE options before answer data. TC is set
                 // because the response no longer carries everything received.
                 let mut trimmed = Vec::new();
-                if wire::drop_ede_to_fit(&answer, limit as u16, &mut trimmed) {
+                if wire::drop_ede_to_fit(&answer, limit as u16, &mut trimmed)
+                    || wire::drop_additional_to_fit(&answer, limit as u16, &mut trimmed)
+                {
                     wire::copy_question_case(raw, &mut trimmed);
                     return Some(trimmed);
                 }
@@ -2033,9 +2169,12 @@ impl Server {
             || cfg.fallback != old.cfg.fallback
             || cfg.upstream_timeout_seconds != old.cfg.upstream_timeout_seconds
             || cfg.upstream_hedge_ms != old.cfg.upstream_hedge_ms
+            || cfg.failure_cache_seconds != old.cfg.failure_cache_seconds
             || cfg.upstream_strategy != old.cfg.upstream_strategy
             || cfg.upstream_0x20 != old.cfg.upstream_0x20
+            || cfg.upstream_source_ports_exclude != old.cfg.upstream_source_ports_exclude
             || cfg.trust_plain_upstreams != old.cfg.trust_plain_upstreams
+            || cfg.home_arpa_server != old.cfg.home_arpa_server
             || cfg.forward_test_names != old.cfg.forward_test_names
             || cfg.upstream_inflight_max != old.cfg.upstream_inflight_max
             || cfg.dnssec != old.cfg.dnssec;
@@ -2386,7 +2525,9 @@ async fn prewarm_saver(server: Arc<Server>) {
     let mut tick = tokio::time::interval_at(start, PREWARM_SAVE_INTERVAL);
     loop {
         tick.tick().await;
-        server.save_prewarm();
+        // Off the async workers: it sorts the pre-warm counters and writes a file.
+        let server = server.clone();
+        let _ = tokio::task::spawn_blocking(move || server.save_prewarm()).await;
     }
 }
 
@@ -2606,6 +2747,12 @@ async fn serve_tcp(
     // so complete frames are serialized and never interleave.
     let mut out = Vec::new();
     let mut hit = TcpHitBuffers::default();
+    // Messages of zone transfers relayed beside the other queries (RFC 5936
+    // §4.2); each is a whole DNS message, written as one frame.
+    let (transfer_tx, mut transfer_rx) = mpsc::channel::<Vec<u8>>(8);
+    // One relay at a time: a second transfer waits its turn, so a connection
+    // never holds more than one upstream transfer connection.
+    let transfer_turn = Arc::new(Semaphore::new(1));
     'conn: loop {
         let can_read = tcp_can_read(
             stopping,
@@ -2615,7 +2762,8 @@ async fn serve_tcp(
             pipeline_max,
             unwritten.load(Ordering::Relaxed),
         );
-        if !can_read && in_flight.is_empty() {
+        // A finished transfer's last messages may still wait in the channel.
+        if !can_read && in_flight.is_empty() && transfer_rx.is_empty() {
             break;
         }
         // No query in flight means the connection is idle: the wait for the
@@ -2632,6 +2780,8 @@ async fn serve_tcp(
                 // burst leaves in one send instead of one per answer.
                 while let Some(result) = joined {
                     match result {
+                        // A relayed transfer that ended; its messages are written.
+                        Ok(Some(answer)) if answer.is_empty() => {}
                         Ok(Some(answer)) => {
                             unwritten.fetch_sub(answer.len(), Ordering::Relaxed);
                             if !push_frame(&mut out, &answer) {
@@ -2647,6 +2797,11 @@ async fn serve_tcp(
                         Err(_) => break 'conn,
                     }
                     joined = if out.len() < TCP_WRITE_BATCH { in_flight.try_join_next() } else { None };
+                }
+            }
+            Some(message) = transfer_rx.recv() => {
+                if !push_frame(&mut out, &message) {
+                    break 'conn;
                 }
             }
             raw = async {
@@ -2669,6 +2824,21 @@ async fn serve_tcp(
                             // Rate limited: no reply, and no further reads, as
                             // for a malformed query.
                             TcpQuery::Dropped => stopping = true,
+                            TcpQuery::Spawn(runtime, _)
+                                if runtime.cfg.client_allowed(ip)
+                                    && wire::parse_query(&raw).is_some_and(|view| wire::is_zone_transfer(&view)) =>
+                            {
+                                // Many messages for one query. It runs beside
+                                // the other queries on the connection (RFC 5936
+                                // §4.2) and outlives none of them: the empty
+                                // answer marks its end, a failure stops reads.
+                                let frames = transfer_tx.clone();
+                                let turn = transfer_turn.clone();
+                                in_flight.spawn(async move {
+                                    let _turn = turn.acquire_owned().await.ok()?;
+                                    relay_transfer(&runtime, &raw, ip, &frames, idle).await.then(Vec::new)
+                                });
+                            }
                             TcpQuery::Spawn(runtime, started) => {
                                 #[cfg(test)]
                                 server.tcp_spawns.fetch_add(1, Ordering::Relaxed);
@@ -2684,9 +2854,17 @@ async fn serve_tcp(
                             }
                         }
                     }
-                    // EOF, a read error, a framing error or the idle timeout
-                    // stops new reads; the answers already in flight are still
-                    // written before the loop exits.
+                    // A read error other than EOF or bad framing means the
+                    // session is gone: answers in flight are not sent (RFC
+                    // 7766 §6.2.4). Dropping the set aborts them.
+                    Some(Err(error))
+                        if !matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::InvalidData) =>
+                    {
+                        return;
+                    }
+                    // EOF (a half-close may still read answers), a framing
+                    // error or the idle timeout stops new reads; the answers
+                    // already in flight are written before the loop exits.
                     _ => stopping = true,
                 }
             }
@@ -2720,6 +2898,44 @@ async fn serve_tcp(
     if matches!(timeout(idle, writer.shutdown()).await, Ok(Ok(()))) {
         let _ = timeout(idle.min(TCP_CLOSE_LINGER), tokio::io::copy(&mut reader, &mut tokio::io::sink())).await;
     }
+}
+
+/// The longest one relayed zone transfer may run.
+const TRANSFER_MAX: Duration = Duration::from_secs(600);
+
+/// Relays one zone transfer message by message from a plain upstream to the
+/// connection's writer. Returns false when the client side is gone or the
+/// upstream breaks off mid-message. A transfer ends when the upstream closes or
+/// goes quiet for `idle`: finding the closing SOA would mean parsing what is
+/// only passed along, and other queries on the connection do not wait for it.
+async fn relay_transfer(
+    runtime: &Runtime,
+    raw: &[u8],
+    ip: IpAddr,
+    frames: &mpsc::Sender<Vec<u8>>,
+    idle: Duration,
+) -> bool {
+    let stream = if runtime.answers_locally(raw, ip) { None } else { runtime.upstreams.open_transfer(raw).await };
+    // The permit holds one of the global transfer slots until the relay ends.
+    let Some((mut stream, _permit)) = stream else {
+        let Some(refusal) = wire::minimal_error_response(raw, u16::from(ResponseCode::Refused)) else { return false };
+        return matches!(timeout(idle, frames.send(refusal)).await, Ok(Ok(())));
+    };
+    stats::count(Outcome::Upstream);
+    let relay = async {
+        let id = raw.get(..2)?;
+        loop {
+            let Ok(Ok(len)) = timeout(idle, stream.read_u16()).await else { return Some(()) };
+            let mut message = vec![0u8; usize::from(len)];
+            timeout(idle, stream.read_exact(&mut message)).await.ok()?.ok()?;
+            // Every message of a transfer carries the query's ID (RFC 5936 §2.2).
+            if message.get(..2) != Some(id) {
+                return Some(());
+            }
+            timeout(idle, frames.send(message)).await.ok()?.ok()?;
+        }
+    };
+    matches!(timeout(TRANSFER_MAX, relay).await, Ok(Some(())))
 }
 
 /// How long a closing TCP connection keeps reading (and discarding) input
@@ -2840,6 +3056,7 @@ fn bind_udp_socket(
     if addr.is_ipv6() {
         socket.set_only_v6(true)?;
     }
+    prevent_fragmentation(&socket, addr)?;
     #[cfg(unix)]
     if reuse_port {
         socket.set_reuse_port(true)?;
@@ -2855,6 +3072,25 @@ fn bind_udp_socket(
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     Ok(socket.into())
+}
+
+/// Replies leave with the don't-fragment flag where that is safe (RFC 9715
+/// R1, R2): IPv6 on Linux and macOS, and IPv4 on macOS. Linux offers DF for
+/// IPv4 UDP only through path MTU discovery, which RFC 9715 Appendix C calls
+/// harmful, so IPv4 there relies on the `udp_max_payload` cap alone. A reply
+/// the path refuses is sent again with TC set ([`send_reply`]).
+fn prevent_fragmentation(socket: &Socket, addr: SocketAddr) -> std::io::Result<()> {
+    use nix::sys::socket::{setsockopt, sockopt};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if addr.is_ipv6() {
+        setsockopt(socket, sockopt::Ipv6DontFrag, &true)?;
+    }
+    #[cfg(target_os = "macos")]
+    if addr.is_ipv4() {
+        setsockopt(socket, sockopt::IpDontFrag, &true)?;
+    }
+    let _ = (socket, addr);
+    Ok(())
 }
 
 /// The TCP twin of [`bind_udp_socket`]: tokio's `bind` leaves IPV6_V6ONLY to
@@ -3050,22 +3286,37 @@ async fn recv_datagram(
 /// Sends one reply. With a known destination `local` (wildcard bind) the reply
 /// goes out from that address (RFC 8085 5.1); if that send fails, or there is
 /// no `local`, it is the plain `send_to` of a specific-address socket.
+/// A reply larger than the path MTU allows (EMSGSIZE under the don't-fragment
+/// flag) goes again with TC set, so the client retries over TCP (RFC 9715 R4).
 #[inline]
 async fn send_reply(socket: &UdpSocket, data: &[u8], peer: SocketAddr, local: Option<IpAddr>) {
+    let Err(error) = send_once(socket, data, peer, local).await else { return };
+    if error.raw_os_error() == Some(nix::libc::EMSGSIZE) {
+        if let Some(truncated) = wire::truncated_from_reply(data) {
+            let _ = send_once(socket, &truncated, peer, local).await;
+        }
+    }
+}
+
+#[inline]
+async fn send_once(socket: &UdpSocket, data: &[u8], peer: SocketAddr, local: Option<IpAddr>) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(local) = local {
-        if udp_pktinfo::send_from(socket, data, peer, local).await.is_ok() {
-            return;
+        match udp_pktinfo::send_from(socket, data, peer, local).await {
+            Ok(_) => return Ok(()),
+            // The plain send would hit the same path MTU.
+            Err(error) if error.raw_os_error() == Some(nix::libc::EMSGSIZE) => return Err(error),
+            Err(_) => {}
         }
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = local;
     // Try the send first: the socket is almost always writable, and skipping
     // the readiness await is +6% hit throughput on Linux.
-    if let Err(error) = socket.try_send_to(data, peer) {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
-            let _ = socket.send_to(data, peer).await;
-        }
+    match socket.try_send_to(data, peer) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => socket.send_to(data, peer).await.map(drop),
+        Err(error) => Err(error),
     }
 }
 
@@ -3268,6 +3519,36 @@ fn effective_worker_threads(configured: usize) -> usize {
     }
 }
 
+/// Descriptors kept for upstream sockets, the DoH pool, the UI, list
+/// downloads and files, on top of the UDP sockets (RFC 9210 section 4.2).
+const FD_HEADROOM: u64 = 128;
+
+/// `tcp_max_connections` that keeps the process below its descriptor limit
+/// with room for `udp_sockets` and `FD_HEADROOM`. Returns the value to use and
+/// whether it was lowered. An unknown limit leaves the setting alone.
+fn clamp_tcp_connections(configured: usize, nofile_soft: Option<u64>, udp_sockets: usize) -> (usize, bool) {
+    let Some(limit) = nofile_soft else { return (configured, false) };
+    let room = limit.saturating_sub(FD_HEADROOM).saturating_sub(udp_sockets as u64);
+    let allowed = usize::try_from(room).unwrap_or(usize::MAX).max(1);
+    if configured > allowed {
+        (allowed, true)
+    } else {
+        (configured, false)
+    }
+}
+
+/// The soft RLIMIT_NOFILE, or `None` where it cannot be read.
+fn nofile_soft_limit() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).ok().map(|(soft, _)| soft)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 /// Batched receive is Linux-only. Elsewhere the key is accepted and ignored, with one
 /// startup warning, so a config written for a Linux node still starts.
 fn effective_udp_batch(configured: usize) -> usize {
@@ -3380,7 +3661,19 @@ async fn run(cfg: Config, path: PathBuf) -> Result<()> {
     let udp_rcvbuf_bytes = cfg.udp_rcvbuf_bytes;
     let udp_sndbuf_bytes = cfg.udp_sndbuf_bytes;
     let udp_batch = effective_udp_batch(cfg.udp_batch);
-    let tcp_max_connections = cfg.tcp_max_connections;
+    let (tcp_max_connections, tcp_clamped) =
+        clamp_tcp_connections(cfg.tcp_max_connections, nofile_soft_limit(), udp_workers.max(1) * cfg.listen.len());
+    if tcp_clamped {
+        log::log(
+            "warn",
+            "tcp_max_connections_clamped",
+            &[
+                ("configured", cfg.tcp_max_connections.to_string()),
+                ("effective", tcp_max_connections.to_string()),
+                ("hint", "raise the open files limit (ulimit -n or LimitNOFILE) to use the configured value".into()),
+            ],
+        );
+    }
     let tcp_max_per_client = cfg.tcp_max_connections_per_client;
     let tcp_queries_per_connection = cfg.tcp_queries_per_connection;
     let tcp_pipeline_max = cfg.tcp_pipeline_max;
@@ -3434,6 +3727,7 @@ async fn run(cfg: Config, path: PathBuf) -> Result<()> {
         tcp_spawns: std::sync::atomic::AtomicUsize::new(0),
         #[cfg(feature = "conformance-adapter")]
         packets: adapter::Packets::default(),
+        udp_permits: std::sync::OnceLock::new(),
         refresh_now: Notify::new(),
         probe: Mutex::new(None),
     });
@@ -3529,6 +3823,7 @@ async fn run(cfg: Config, path: PathBuf) -> Result<()> {
     }
 
     let udp_permits = Arc::new(Semaphore::new(udp_inflight_max));
+    let _ = server.udp_permits.set((udp_permits.clone(), udp_inflight_max));
     let tcp_permits = Arc::new(Semaphore::new(tcp_max_connections));
     let per_client = Arc::new(PerClient::default());
     // Existing connections stop reading new frames on shutdown and drain the
@@ -3705,6 +4000,7 @@ mod tests {
             tcp_spawns: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "conformance-adapter")]
             packets: adapter::Packets::default(),
+            udp_permits: std::sync::OnceLock::new(),
             refresh_now: Notify::new(),
             probe: Mutex::new(None),
         })
@@ -3752,6 +4048,16 @@ mod tests {
         assert_eq!(second.local_addr().unwrap(), addr, "the second bind uses the same concrete address");
         drop(first);
     }
+    /// RFC 9210 section 4.2: connection limits stay below RLIMIT_NOFILE.
+    #[test]
+    fn tcp_connections_are_clamped_below_the_descriptor_limit() {
+        // 1024 - 128 headroom - 4 UDP sockets = 892.
+        assert_eq!(clamp_tcp_connections(256, Some(1024), 4), (256, false));
+        assert_eq!(clamp_tcp_connections(2000, Some(1024), 4), (892, true));
+        assert_eq!(clamp_tcp_connections(2000, None, 4), (2000, false));
+        assert_eq!(clamp_tcp_connections(2000, Some(100), 4), (1, true), "never below one");
+    }
+
     #[test]
     fn effective_worker_threads_defaults_and_explicit_counts() {
         assert!(effective_worker_threads(0) >= 1, "0 asks for the platform default, never zero threads");
@@ -3888,6 +4194,444 @@ mod tests {
         let leader_ip = "127.0.0.1".parse().unwrap();
         assert!(PerClient::take(&s.runtime().fair, leader_ip, 1).is_some(), "no slot outlives the work");
     }
+    /// Opens a TCP connection to a server, sends `raw` and returns the frames
+    /// that come back before the server closes.
+    async fn tcp_frames(s: &Arc<Server>, raw: &[u8]) -> Vec<Vec<u8>> {
+        tcp_frames_for(s, &[raw]).await
+    }
+
+    /// Sends every query on one connection, then reads every reply frame.
+    async fn tcp_frames_for(s: &Arc<Server>, queries: &[&[u8]]) -> Vec<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let (_stop, shutdown) = watch::channel(false);
+        tokio::spawn(serve_tcp(s.clone(), accepted, peer, Duration::from_secs(2), 1000, 16, shutdown));
+        let mut frame = Vec::new();
+        for raw in queries {
+            frame.extend_from_slice(&u16::try_from(raw.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(raw);
+        }
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut frames = Vec::new();
+        let mut len = [0u8; 2];
+        while timeout(Duration::from_secs(3), client.read_exact(&mut len)).await.unwrap().is_ok() {
+            let mut body = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            client.read_exact(&mut body).await.unwrap();
+            frames.push(body);
+        }
+        frames
+    }
+
+    /// RFC 5625 §4.3 with RFC 5936: a transfer is a stream of messages, so it
+    /// is relayed frame by frame over TCP to a plain upstream. DoH cannot
+    /// carry one, and AXFR over UDP is not defined.
+    #[tokio::test]
+    async fn rfc5625_s215_a_zone_transfer_streams_over_tcp_to_a_plain_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let raw = query("zone.test", RecordType::AXFR).to_vec().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            stream.read_exact(&mut query).await.unwrap();
+            let mut frames = Vec::new();
+            for n in 0..3u8 {
+                let mut message = Message::from_vec(&query).unwrap();
+                message.metadata.message_type = MessageType::Response;
+                let owner = message.queries[0].name().clone();
+                message.add_answer(Record::from_rdata(owner, 60, RData::A(A::new(192, 0, 2, n))));
+                let body = message.to_vec().unwrap();
+                stream.write_all(&(body.len() as u16).to_be_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+                frames.push(body);
+            }
+            (query, frames)
+        });
+        let s =
+            server(Config { upstreams: vec![], fallback: vec![addr], forward_test_names: true, ..Config::default() });
+        // A second query on the same connection, answered locally (NXNAME),
+        // shows the transfer did not end the connection (RFC 7766 §6.2.1).
+        let mut next = query("zone.test", RecordType::Unknown(128));
+        next.metadata.id = 43;
+        let next = next.to_vec().unwrap();
+        let frames = tcp_frames_for(&s, &[&raw, &next]).await;
+        let (seen, sent) = timeout(Duration::from_secs(3), upstream).await.expect("the upstream is asked").unwrap();
+        assert_eq!(seen, raw, "the query goes unchanged");
+        let (others, transfer): (Vec<_>, Vec<_>) = frames.into_iter().partition(|frame| frame[..2] != raw[..2]);
+        assert_eq!(others.len(), 1, "the other query on the connection is answered");
+        assert_eq!(code(&others[0]), ResponseCode::FormErr);
+        assert_eq!(transfer, sent, "every message comes back unchanged and in order");
+
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let udp = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+        assert_eq!(udp.metadata.response_code, ResponseCode::Refused, "AXFR over UDP is not defined");
+
+        let doh_only =
+            server(Config { upstreams: vec![], fallback: vec![], forward_test_names: true, ..Config::default() });
+        let frames = tcp_frames(&doh_only, &raw).await;
+        assert_eq!(frames.len(), 1);
+        assert_eq!(code(&frames[0]), ResponseCode::Refused, "nothing here can carry a transfer");
+    }
+
+    /// RFC 5936 §4.2: other queries on the connection are served while a
+    /// transfer runs, here one whose upstream keeps its connection open.
+    #[tokio::test]
+    async fn a_query_behind_a_transfer_is_not_held_up_by_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+            stream.read_exact(&mut query).await.unwrap();
+            let mut message = Message::from_vec(&query).unwrap();
+            message.metadata.message_type = MessageType::Response;
+            let body = message.to_vec().unwrap();
+            stream.write_all(&(body.len() as u16).to_be_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            // Silent but open, as a server waiting for its next query.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let s =
+            server(Config { upstreams: vec![], fallback: vec![addr], forward_test_names: true, ..Config::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let (_stop, shutdown) = watch::channel(false);
+        tokio::spawn(serve_tcp(s.clone(), accepted, peer, Duration::from_secs(10), 1000, 16, shutdown));
+        let mut transfer = query("zone.test", RecordType::AXFR);
+        transfer.metadata.id = 1;
+        let mut next = query("zone.test", RecordType::Unknown(128));
+        next.metadata.id = 2;
+        let mut bytes = Vec::new();
+        for message in [transfer, next] {
+            let body = message.to_vec().unwrap();
+            bytes.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(&body);
+        }
+        client.write_all(&bytes).await.unwrap();
+        let read = async {
+            let mut ids = Vec::new();
+            while !ids.contains(&2) {
+                let mut len = [0u8; 2];
+                client.read_exact(&mut len).await.unwrap();
+                let mut body = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                client.read_exact(&mut body).await.unwrap();
+                ids.push(u16::from_be_bytes([body[0], body[1]]));
+            }
+            ids
+        };
+        timeout(Duration::from_secs(2), read).await.expect("the second query is answered while the transfer runs");
+        upstream.abort();
+    }
+
+    /// Two transfers on one connection both complete, one after the other, so
+    /// the connection never holds two upstream transfer connections.
+    #[tokio::test]
+    async fn transfers_on_one_connection_take_turns_upstream() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (open, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let upstream = {
+            let (open, most) = (open.clone(), most.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (open, most) = (open.clone(), most.clone());
+                    tokio::spawn(async move {
+                        most.fetch_max(open.fetch_add(1, SeqCst) + 1, SeqCst);
+                        let mut len = [0u8; 2];
+                        stream.read_exact(&mut len).await.unwrap();
+                        let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                        stream.read_exact(&mut query).await.unwrap();
+                        let mut message = Message::from_vec(&query).unwrap();
+                        message.metadata.message_type = MessageType::Response;
+                        let body = message.to_vec().unwrap();
+                        stream.write_all(&(body.len() as u16).to_be_bytes()).await.unwrap();
+                        stream.write_all(&body).await.unwrap();
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        open.fetch_sub(1, SeqCst);
+                    });
+                }
+            })
+        };
+        let s =
+            server(Config { upstreams: vec![], fallback: vec![addr], forward_test_names: true, ..Config::default() });
+        let (mut first, mut second) = (query("zone.test", RecordType::AXFR), query("zone.test", RecordType::AXFR));
+        (first.metadata.id, second.metadata.id) = (1, 2);
+        let (first, second) = (first.to_vec().unwrap(), second.to_vec().unwrap());
+        let frames = tcp_frames_for(&s, &[&first, &second]).await;
+        let mut ids: Vec<u16> = frames.iter().map(|frame| u16::from_be_bytes([frame[0], frame[1]])).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [1, 2], "both transfers are relayed");
+        assert_eq!(most.load(SeqCst), 1, "never two upstream transfer connections at once");
+        upstream.abort();
+    }
+
+    /// RFC 5625 §4.3: requests are proxied whatever their QTYPE and QCLASS.
+    /// RFC 8482 and RFC 9824 are the exceptions, and name policy still applies.
+    /// None of this is cached.
+    #[tokio::test]
+    async fn rfc5625_s215_requests_are_proxied_whatever_their_qtype_and_qclass() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (upstream, _peer) = serve_udp_replies(requests.clone(), |q| reply(q, ResponseCode::NoError)).await;
+        let s = server(Config { upstreams: vec![], fallback: vec![upstream], ..Config::default() });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let ask = |name: &str, qtype: RecordType, class: DNSClass| {
+            let mut q = query(name, qtype);
+            q.queries[0].set_query_class(class);
+            let (s, raw) = (s.clone(), q.to_vec().unwrap());
+            async move { Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap() }
+        };
+        let proxied = [
+            (RecordType::TXT, DNSClass::CH),
+            (RecordType::A, DNSClass::ANY),
+            (RecordType::A, DNSClass::NONE),
+            (RecordType::Unknown(200), DNSClass::IN),
+            (RecordType::Unknown(0), DNSClass::IN),
+            (RecordType::Unknown(250), DNSClass::IN),
+            (RecordType::Unknown(41), DNSClass::IN),
+        ];
+        for (qtype, class) in proxied {
+            for pass in 1..=2 {
+                let before = requests.load(SeqCst);
+                let a = ask("proxied.test", qtype, class).await;
+                assert_eq!(a.metadata.response_code, ResponseCode::NoError, "{qtype} {class:?}");
+                assert_eq!(requests.load(SeqCst), before + 1, "{qtype} {class:?}: pass {pass} goes upstream");
+            }
+        }
+        let before = requests.load(SeqCst);
+        let a = ask("version.bind", RecordType::TXT, DNSClass::CH).await;
+        assert_eq!(a.metadata.response_code, ResponseCode::Refused, "name policy, not class policy");
+        // RFC 9824 §3.5 is the one local FORMERR left (RFC 5625 §4.3).
+        let a = ask("proxied.test", RecordType::Unknown(128), DNSClass::IN).await;
+        assert_eq!(a.metadata.response_code, ResponseCode::FormErr, "NXNAME");
+        assert_eq!(requests.load(SeqCst), before);
+    }
+
+    /// RFC 8375 §4: `home.arpa` can go to its authoritative server, and only
+    /// there. The DS proof at the apex still comes from the public tree.
+    #[tokio::test]
+    async fn rfc8375_s302_home_arpa_can_be_forwarded_to_its_authoritative_server() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let answer = |last: u8| {
+            move |q: &Message| {
+                let mut a = reply(q, ResponseCode::NoError);
+                let data = RData::A(A::new(192, 0, 2, last));
+                a.add_answer(Record::from_rdata(q.queries[0].name().clone(), 60, data));
+                a
+            }
+        };
+        let (public, home) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (public_addr, _public) = serve_udp_replies(public.clone(), answer(1)).await;
+        let (home_addr, _home) = serve_udp_replies(home.clone(), answer(2)).await;
+        let s = server(Config {
+            upstreams: vec![],
+            fallback: vec![public_addr],
+            home_arpa_server: Some(home_addr),
+            ..Config::default()
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let raw = query("nas.home.arpa", RecordType::A).to_vec().unwrap();
+        let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+        assert_eq!(answer_a(&a.to_vec().unwrap()), Some(std::net::Ipv4Addr::new(192, 0, 2, 2)));
+        assert_eq!((home.load(SeqCst), public.load(SeqCst)), (1, 0), "only the home server is asked");
+
+        let mut ds = query("home.arpa", RecordType::DS);
+        ds.edns.get_or_insert_with(Default::default).set_dnssec_ok(true);
+        s.handle(&ds.to_vec().unwrap(), ip, true).await.unwrap();
+        assert_eq!((home.load(SeqCst), public.load(SeqCst)), (1, 1), "the DS proof is public");
+
+        let raw = query("x.service.arpa", RecordType::A).to_vec().unwrap();
+        let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+        assert_eq!(a.metadata.response_code, ResponseCode::NXDomain, "service.arpa stays local");
+    }
+
+    /// RFC 2308 §8: a name error holds for the name and class, so any QTYPE
+    /// of a denied name is answered from the cache. NODATA stays per QTYPE,
+    /// and an NXDOMAIN at the end of a CNAME says nothing about the alias.
+    #[tokio::test]
+    async fn rfc2308_s615b_a_name_error_is_cached_for_every_qtype() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (upstream, _peer) = serve_udp_replies(requests.clone(), |q| {
+            let query = &q.queries[0];
+            let name = query.name().to_ascii().to_lowercase();
+            let code = if name.starts_with("nodata") { ResponseCode::NoError } else { ResponseCode::NXDomain };
+            let mut a = reply(q, code);
+            if name.starts_with("alias") || name.starts_with("cross") {
+                let target = if name.starts_with("cross") { "victim.example." } else { "gone.test." };
+                let target = Name::from_ascii(target).unwrap();
+                a.add_answer(Record::from_rdata(
+                    query.name().clone(),
+                    60,
+                    RData::CNAME(hickory_proto::rr::rdata::CNAME(target)),
+                ));
+            }
+            let soa = SOA::new(
+                Name::from_ascii("test.").unwrap(),
+                Name::from_ascii("host.test.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                60,
+            );
+            a.add_authority(Record::from_rdata(Name::from_ascii("test.").unwrap(), 60, RData::SOA(soa)));
+            a
+        })
+        .await;
+        // The plain mock stands in for a trusted resolver; untrusted sources are below.
+        let s = server(Config {
+            upstreams: vec![],
+            fallback: vec![upstream],
+            trust_plain_upstreams: true,
+            ..Config::default()
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let ask = |name: &str, qtype| {
+            let (s, raw) = (s.clone(), query(name, qtype).to_vec().unwrap());
+            async move { Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap() }
+        };
+        ask("missing.test", RecordType::A).await;
+        assert_eq!(requests.load(SeqCst), 1);
+        let other = ask("missing.test", RecordType::AAAA).await;
+        assert_eq!(requests.load(SeqCst), 1, "the name error covers AAAA");
+        assert_eq!(other.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(other.queries[0].query_type(), RecordType::AAAA, "the question is the client's");
+        assert_eq!(other.authorities.len(), 1, "the SOA comes with it");
+        let again = ask("missing.test", RecordType::A).await;
+        assert_eq!(again.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(requests.load(SeqCst), 1, "the exact entry survives the name-level one");
+
+        ask("nodata.test", RecordType::A).await;
+        ask("nodata.test", RecordType::AAAA).await;
+        assert_eq!(requests.load(SeqCst), 3, "NODATA is per QTYPE");
+
+        ask("alias.test", RecordType::A).await;
+        ask("alias.test", RecordType::AAAA).await;
+        assert_eq!(requests.load(SeqCst), 5, "the alias itself exists");
+
+        // RFC 8020 §2: the denied name is the chain's last, and its name
+        // error is cached for every QTYPE.
+        let target = ask("Gone.test", RecordType::MX).await;
+        assert_eq!(requests.load(SeqCst), 5, "the CNAME target's name error comes from the cache");
+        assert_eq!(target.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(target.queries[0].name().to_ascii(), "Gone.test.", "the client's question and case");
+        assert_eq!(target.queries[0].query_type(), RecordType::MX);
+        assert!(target.answers.is_empty(), "no alias record for the target itself");
+        assert_eq!(target.authorities.len(), 1, "the SOA comes with it");
+
+        // A test. SOA cannot deny victim.example: that name is asked for.
+        ask("cross.test", RecordType::A).await;
+        assert_eq!(requests.load(SeqCst), 6);
+        ask("victim.example", RecordType::A).await;
+        assert_eq!(requests.load(SeqCst), 7, "a denial outside the SOA's zone is not cached for the target");
+
+        // A source not trusted for every name never denies one other than
+        // the question: an untrusted plain fallback (spoofable off path) and
+        // a home_arpa_server reply (it speaks for home.arpa only).
+        for (label, cfg, alias) in [
+            ("plain", Config { upstreams: vec![], fallback: vec![upstream], ..Config::default() }, "alias.test"),
+            (
+                "home",
+                Config {
+                    upstreams: vec![],
+                    fallback: vec![upstream],
+                    trust_plain_upstreams: true,
+                    home_arpa_server: Some(upstream),
+                    ..Config::default()
+                },
+                "alias.home.arpa",
+            ),
+        ] {
+            let s = server(cfg);
+            let before = requests.load(SeqCst);
+            for (name, qtype) in [(alias, RecordType::A), ("gone.test", RecordType::MX)] {
+                let raw = query(name, qtype).to_vec().unwrap();
+                s.handle(&raw, ip, true).await.unwrap();
+            }
+            assert_eq!(requests.load(SeqCst), before + 2, "{label}: the chain's last name is asked for itself");
+        }
+    }
+
+    /// RFC 2181 §9: extra data that does not fit is omitted with TC clear, on
+    /// the miss and on the cache hit. TC is for a required RRset.
+    #[tokio::test]
+    async fn rfc2181_s589_additional_data_that_does_not_fit_is_dropped_without_tc() {
+        let extras = |q: &Message, answers: u8| {
+            let mut a = reply(q, ResponseCode::NoError);
+            for n in 0..answers {
+                let data = RData::A(A::new(192, 0, 2, n));
+                a.add_answer(Record::from_rdata(q.queries[0].name().clone(), 60, data));
+            }
+            for n in 0..60 {
+                let owner = Name::from_ascii(format!("extra{n}.test.")).unwrap();
+                a.add_additional(Record::from_rdata(owner, 60, RData::A(A::new(192, 0, 2, n))));
+            }
+            a
+        };
+        let (upstream, _peer) = serve_udp_replies(Default::default(), move |q| {
+            let required = q.queries[0].name().to_ascii().to_lowercase().starts_with("big");
+            extras(q, if required { 60 } else { 1 })
+        })
+        .await;
+        let s = server(Config {
+            upstreams: vec![],
+            fallback: vec![upstream],
+            trust_plain_upstreams: true,
+            ..Config::default()
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let raw = query("small.test", RecordType::A).to_vec().unwrap();
+        for pass in ["miss", "hit"] {
+            let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+            assert!(!a.metadata.truncation, "{pass}: extra data is no reason for TC");
+            assert_eq!(a.answers.len(), 1, "{pass}");
+            assert!(a.additionals.is_empty(), "{pass}");
+        }
+        let raw = query("big.test", RecordType::A).to_vec().unwrap();
+        let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+        assert!(a.metadata.truncation, "a required RRset that cannot fit sets TC");
+    }
+
+    /// RFC 7766 §6.2.4: a reset means the client is gone, so the connection
+    /// ends at once and the answer in flight is not written.
+    #[tokio::test]
+    async fn rfc7766_s533_a_reset_drops_the_answers_in_flight() {
+        use socket2::SockRef;
+        use std::sync::atomic::Ordering::SeqCst;
+        use tokio::io::AsyncWriteExt;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (upstream, _peer) = serve_udp(true, Duration::from_secs(2), requests.clone()).await;
+        let s = server(Config { upstreams: vec![], fallback: vec![upstream], ..Config::default() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (accepted, peer) = listener.accept().await.unwrap();
+        let (_stop, shutdown) = watch::channel(false);
+        let conn = tokio::spawn(serve_tcp(s.clone(), accepted, peer, Duration::from_secs(10), 1000, 16, shutdown));
+        let raw = query("reset.test", RecordType::A).to_vec().unwrap();
+        let mut frame = u16::try_from(raw.len()).unwrap().to_be_bytes().to_vec();
+        frame.extend_from_slice(&raw);
+        client.write_all(&frame).await.unwrap();
+        wait_until(|| requests.load(SeqCst) == 1).await;
+
+        SockRef::from(&client).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(client);
+        timeout(Duration::from_millis(500), conn).await.expect("no wait for the answer").unwrap();
+    }
+
     /// At the per-connection query cap the server answers the queries it
     /// accepted and then closes cleanly: FIN after the last answer, never a
     /// reset that would discard answers still in flight to the client. The
@@ -3985,7 +4729,7 @@ mod tests {
             assert_eq!(a.answers[0].name, q.queries[0].name().clone());
         }
         assert!(s.handle(&[0, 1], "127.0.0.1".parse().unwrap(), true).await.is_none());
-        let mut q = query("x", RecordType::A);
+        let mut q = query("id.server", RecordType::TXT);
         q.queries[0].set_query_class(DNSClass::CH);
         let a = s.handle(&q.to_vec().unwrap(), "127.0.0.1".parse().unwrap(), true).await.unwrap();
         assert_eq!(Message::from_vec(&a).unwrap().metadata.response_code, ResponseCode::Refused);
@@ -4039,7 +4783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_ptr_forward_mode_forwards_the_ptr_path_only() {
+    async fn rfc6303_s194_private_ptr_forward_disables_local_reverse_zones_for_every_type() {
         let s = server(Config {
             private_ptr: PrivatePtr::Forward,
             upstreams: vec![],
@@ -4052,11 +4796,22 @@ mod tests {
             let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
             assert_eq!(answer.metadata.response_code, ResponseCode::ServFail, "{name} must be forwarded");
         }
-        // Zone apex service is not the PTR path and stays local.
-        let q = query("10.in-addr.arpa", RecordType::SOA);
-        let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
-        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(answer.answers.len(), 1);
+        // Every type in those zones goes upstream, not only PTR.
+        for (name, qtype) in [
+            ("10.in-addr.arpa", RecordType::SOA),
+            ("10.in-addr.arpa", RecordType::NS),
+            ("1.0.0.10.in-addr.arpa", RecordType::TXT),
+        ] {
+            let q = query(name, qtype);
+            let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
+            assert_eq!(answer.metadata.response_code, ResponseCode::ServFail, "{name} {qtype} must be forwarded");
+        }
+        // RFC 6598 §4 and RFC 8375 §4 still forbid forwarding these.
+        for (name, qtype) in [("1.64.100.in-addr.arpa", RecordType::TXT), ("printer.home.arpa", RecordType::PTR)] {
+            let q = query(name, qtype);
+            let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
+            assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain, "{name} stays local");
+        }
     }
 
     #[tokio::test]
@@ -4203,6 +4958,48 @@ mod tests {
         assert_eq!(answer.metadata.response_code, ResponseCode::ServFail);
     }
 
+    /// RFC 6303 §4 empty zones: the SOA RNAME and TTL and the NS target are
+    /// configurable, and reach the apex, the negative SOA and the NS answer.
+    #[tokio::test]
+    async fn empty_zone_soa_rname_ttl_and_ns_are_configurable() {
+        let mut cfg: Config = toml::from_str(
+            "empty_zone_soa_rname = \"hostmaster.example.\"\nempty_zone_ttl = 300\nempty_zone_ns = \"ns.example.\"",
+        )
+        .unwrap();
+        cfg.upstreams = vec![];
+        cfg.fallback = vec![];
+        cfg.validate().unwrap();
+        let s = server_exact(cfg);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let apex = Name::from_ascii("10.in-addr.arpa.").unwrap();
+
+        let q = query("10.in-addr.arpa", RecordType::SOA);
+        let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
+        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+        assert!(answer.metadata.authoritative);
+        assert_eq!(answer.answers[0].ttl, 300);
+        let RData::SOA(soa) = &answer.answers[0].data else { panic!("SOA") };
+        assert_eq!(soa.mname, apex);
+        assert_eq!(soa.rname.to_ascii(), "hostmaster.example.");
+        assert_eq!(soa.minimum, 300);
+
+        let q = query("10.in-addr.arpa", RecordType::NS);
+        let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
+        assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+        assert!(answer.metadata.authoritative);
+        assert_eq!(answer.answers[0].ttl, 300);
+        let RData::NS(ns) = &answer.answers[0].data else { panic!("NS") };
+        assert_eq!(ns.0.to_ascii(), "ns.example.");
+
+        let q = query("1.0.10.in-addr.arpa", RecordType::A);
+        let answer = Message::from_vec(&s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap()).unwrap();
+        assert_eq!(answer.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(answer.authorities[0].ttl, 300);
+        let RData::SOA(soa) = &answer.authorities[0].data else { panic!("SOA") };
+        assert_eq!(soa.rname.to_ascii(), "hostmaster.example.");
+        assert_eq!(soa.minimum, 300);
+    }
+
     #[tokio::test]
     async fn home_arpa_is_local_except_the_ds_probe() {
         let s = server(Config { upstreams: vec![], fallback: vec![], ..Config::default() });
@@ -4279,7 +5076,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_policy_applies_in_every_class_and_query_classes_are_refused() {
+    async fn local_policy_applies_in_every_class_and_query_classes_are_forwarded() {
         let mut cfg = Config {
             user_rules: vec!["||blocked.test^".into()],
             rewrites: HashMap::from([("rewrite.test".into(), "::1".parse().unwrap())]),
@@ -4313,11 +5110,9 @@ mod tests {
             ("x.invalid", RecordType::A, hs, ResponseCode::NXDomain, 0),
             ("localhost", RecordType::A, any, ResponseCode::NoError, 0),
             ("localhost", RecordType::A, hs, ResponseCode::NoError, 0),
-            // QCLASS ANY and NONE are never forwarded.
-            ("example.com", RecordType::A, any, ResponseCode::Refused, 0),
-            ("example.com", RecordType::A, none, ResponseCode::Refused, 0),
-            ("a.test", RecordType::A, any, ResponseCode::Refused, 0),
-            // Another data class is forwarded.
+            // Every other class is forwarded (RFC 5625 §4.3).
+            ("example.com", RecordType::A, any, ResponseCode::ServFail, 0),
+            ("example.com", RecordType::A, none, ResponseCode::ServFail, 0),
             ("example.com", RecordType::A, hs, ResponseCode::ServFail, 0),
         ];
         for (name, record_type, class, expected, count) in queries {
@@ -4411,7 +5206,10 @@ mod tests {
         Record::from_rdata(
             name.clone(),
             60,
-            RData::Unknown { code: RecordType::RRSIG, rdata: hickory_proto::rr::rdata::NULL::with(vec![0, 1, 2]) },
+            RData::Unknown {
+                code: RecordType::RRSIG,
+                rdata: hickory_proto::rr::rdata::NULL::with(vec![1; 18].into_iter().chain([0, 9]).collect()),
+            },
         )
     }
     /// A DoH upstream that records each non-probe query's (EDNS, DO) and always
@@ -4480,18 +5278,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_and_meta_qtypes_are_formerr_and_never_forwarded() {
-        // RFC 6895 §3.1: TYPE 0 is reserved, like the meta-TYPEs.
+    async fn nxname_qtype_is_formerr_and_never_forwarded() {
+        // RFC 9824 §3.5.
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (addr, _peer) = serve_udp_replies(requests.clone(), |q| reply(q, ResponseCode::NoError)).await;
         let s = server(Config { upstreams: vec![], fallback: vec![addr], ..Config::default() });
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        for qtype in [0u16, 41, 128, 248, 250] {
-            let raw = query("x.test", RecordType::from(qtype)).to_vec().unwrap();
-            let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
-            assert_eq!(a.metadata.response_code, ResponseCode::FormErr, "QTYPE {qtype}");
-        }
+        let raw = query("x.test", RecordType::from(128u16)).to_vec().unwrap();
+        let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+        assert_eq!(a.metadata.response_code, ResponseCode::FormErr, "QTYPE 128");
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing reached the upstream");
+    }
+
+    #[tokio::test]
+    async fn opt_qtype_is_proxied_like_any_other_type() {
+        // RFC 5625 §4.3: every QTYPE is proxied, OPT (41) included. It is a
+        // meta type, so the answer is never cached.
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (addr, _peer) = serve_udp_replies(requests.clone(), |q| reply(q, ResponseCode::NoError)).await;
+        let s = server(Config { upstreams: vec![], fallback: vec![addr], ..Config::default() });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let raw = query("x.test", RecordType::from(41u16)).to_vec().unwrap();
+        for _ in 0..2 {
+            let a = Message::from_vec(&s.handle(&raw, ip, true).await.unwrap()).unwrap();
+            assert_eq!(a.metadata.response_code, ResponseCode::NoError, "the upstream reply is relayed");
+        }
+        assert_eq!(requests.load(SeqCst), 2, "a meta type is never cached, so both queries go upstream");
     }
 
     #[tokio::test]
@@ -4652,7 +5465,12 @@ mod tests {
         }
         let mut buf = vec![0; 65535];
         let (n, peer) = timeout(Duration::from_secs(1), socket.recv_from(&mut buf)).await.unwrap().unwrap();
-        assert!(timeout(Duration::from_millis(20), socket.recv_from(&mut vec![0; 65535])).await.is_err());
+        // A retransmission repeats the datagram; a second refresh would carry
+        // a new ID.
+        let mut other = vec![0; 65535];
+        while let Ok(Ok((m, _))) = timeout(Duration::from_millis(20), socket.recv_from(&mut other)).await {
+            assert_eq!(other[..m], buf[..n], "one refresh");
+        }
         let mut a = reply(&Message::from_vec(&buf[..n]).unwrap(), ResponseCode::NoError);
         a.add_answer(Record::from_rdata(q.queries[0].name().clone(), 120, RData::A(A::new(192, 0, 2, 2))));
         socket.send_to(&wire_reply(&buf[..n], a), peer).await.unwrap();
@@ -4856,6 +5674,25 @@ mod tests {
         ad: bool,
         requests: Arc<std::sync::atomic::AtomicUsize>,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        serve_doh_with(age, requests, move |parsed| {
+            let mut answer = reply(parsed, ResponseCode::NoError);
+            answer.add_answer(Record::from_rdata(
+                parsed.queries[0].name().clone(),
+                ttl,
+                RData::A(A::new(192, 0, 2, 7)),
+            ));
+            answer.metadata.authentic_data = ad;
+            answer
+        })
+        .await
+    }
+
+    /// A plain-HTTP DoH upstream whose answers `make` builds.
+    async fn serve_doh_with(
+        age: u32,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        make: impl Fn(&Message) -> Message + Send + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -4879,14 +5716,7 @@ mod tests {
                 }
                 let Ok(parsed) = Message::from_vec(&body) else { continue };
                 requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let mut answer = reply(&parsed, ResponseCode::NoError);
-                answer.add_answer(Record::from_rdata(
-                    parsed.queries[0].name().clone(),
-                    ttl,
-                    RData::A(A::new(192, 0, 2, 7)),
-                ));
-                answer.metadata.authentic_data = ad;
-                let answer = answer.to_vec().unwrap();
+                let answer = make(&parsed).to_vec().unwrap();
                 let response_head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nAge: {age}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     answer.len()
@@ -4899,6 +5729,50 @@ mod tests {
         });
         (format!("http://{addr}/dns-query"), task)
     }
+    /// The chain's-last-name denial (RFC 8020 §2) is rebuilt from the parsed
+    /// answer, so it must carry only the AD the client profile allows.
+    #[tokio::test]
+    async fn rfc8020_s2_a_chain_denial_never_asserts_ad_the_client_did_not_get() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (url, peer) = serve_doh_with(0, requests.clone(), |q| {
+            let mut a = reply(q, ResponseCode::NXDomain);
+            if q.queries[0].name().to_ascii().to_lowercase().starts_with("alias") {
+                let target = hickory_proto::rr::rdata::CNAME(Name::from_ascii("gone.test.").unwrap());
+                a.add_answer(Record::from_rdata(q.queries[0].name().clone(), 60, RData::CNAME(target)));
+            }
+            let soa = SOA::new(
+                Name::from_ascii("test.").unwrap(),
+                Name::from_ascii("h.test.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                60,
+            );
+            a.add_authority(Record::from_rdata(Name::from_ascii("test.").unwrap(), 60, RData::SOA(soa)));
+            a.metadata.authentic_data = true;
+            a
+        })
+        .await;
+        let s = server(Config { upstreams: vec![url], fallback: vec![], ..Config::default() });
+        let ip = "127.0.0.1".parse().unwrap();
+        let ask = |name: &str, ad: bool| {
+            let mut q = query(name, RecordType::A);
+            q.metadata.authentic_data = ad;
+            let (s, raw) = (s.clone(), q.to_vec().unwrap());
+            async move { Message::from_vec(&s.handle(&raw, ip, false).await.unwrap()).unwrap() }
+        };
+        assert!(!ask("alias.test", false).await.metadata.authentic_data);
+        let target = ask("gone.test", false).await;
+        assert_eq!(requests.load(SeqCst), 1, "the target's denial comes from the cache");
+        assert!(!target.metadata.authentic_data, "a client without AD or DO never gets AD from the denial");
+        assert!(ask("alias.test", true).await.metadata.authentic_data, "an AD client gets the upstream AD");
+        assert!(ask("gone.test", true).await.metadata.authentic_data, "and on the cached denial too");
+        assert_eq!(requests.load(SeqCst), 2);
+        peer.abort();
+    }
+
     #[tokio::test]
     async fn zero_ttl_after_age_is_relayed_but_not_cached() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -4948,7 +5822,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncached_doh_ad_follows_the_conservative_client_profile() {
+    async fn rfc4035_s1016_doh_ad_follows_the_client_on_relay_and_fresh_hits() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
         let requests = Arc::new(AtomicUsize::new(0));
         let (url, peer) = serve_doh(60, 0, true, requests.clone()).await;
@@ -4964,19 +5838,19 @@ mod tests {
         let mut ad_query = query("ad-profile.test", RecordType::A);
         ad_query.metadata.authentic_data = true;
         let ad_query = ad_query.to_vec().unwrap();
-        // Only the directly relayed answer keeps AD (RFC 6840 §5.8); a cache hit has no
-        // validation-lifetime metadata and clears it.
-        for first in [true, false] {
+        // RFC 4035 s1016 / RFC 6840 §5.8: the trusted DoH answer keeps AD for an AD
+        // client, on the relay and on fresh hits of that client's cache variant.
+        for _ in 0..2 {
             let answer = Message::from_vec(&s.handle(&ad_query, ip, false).await.unwrap()).unwrap();
-            assert_eq!(answer.metadata.authentic_data, first, "AD kept on the relay, cleared on a hit");
+            assert!(answer.metadata.authentic_data, "AD kept on the relay and on a fresh hit");
         }
 
         let mut do_query = query("ad-profile.test", RecordType::A);
         do_query.edns.get_or_insert_with(Default::default).set_dnssec_ok(true);
         let do_query = do_query.to_vec().unwrap();
-        for first in [true, false] {
+        for _ in 0..2 {
             let answer = Message::from_vec(&s.handle(&do_query, ip, false).await.unwrap()).unwrap();
-            assert_eq!(answer.metadata.authentic_data, first, "AD kept on the relay when DO is set, cleared on a hit");
+            assert!(answer.metadata.authentic_data, "AD kept on the relay and on a fresh hit when DO is set");
         }
 
         assert_eq!(requests.load(SeqCst), 3, "one upstream call per cache key");
@@ -5709,7 +6583,10 @@ mod tests {
         let s = server(Config {
             upstreams: vec![],
             fallback: vec![addr],
-            upstream_timeout_seconds: 2,
+            // Four copies of one question share two in-flight slots (RFC 5452
+            // s5), so two clients queue behind the first replies; a loaded test
+            // host must not run them out of budget.
+            upstream_timeout_seconds: 5,
             ..Config::default()
         });
         let ip = "127.0.0.1".parse().unwrap();
@@ -5731,15 +6608,25 @@ mod tests {
                         ));
                     }
                     let answer = s.handle(&q.to_vec().unwrap(), ip, false).await.unwrap();
-                    (q.metadata.id, Message::from_vec(&answer).unwrap().metadata.id)
+                    let answer = Message::from_vec(&answer).unwrap();
+                    (q.metadata.id, answer.metadata.id, answer.metadata.response_code)
                 });
             }
         }
         while let Some(result) = clients.join_next().await {
-            let (sent, got) = result.unwrap();
+            let (sent, got, rcode) = result.unwrap();
             assert_eq!(sent, got, "each bypass caller gets its own reply");
+            // An answer, not a SERVFAIL: a client that ran out of budget in the
+            // slot queue sent nothing upstream and would pass as coalesced.
+            assert_eq!(rcode, ResponseCode::NoError, "client {sent:#x} was answered upstream");
         }
-        assert_eq!(requests.load(SeqCst), 4, "unknown EDNS flags and extra sections never coalesce");
+        // Every client was answered upstream, so a count under 4 is coalescing;
+        // a resend under load may raise it.
+        let sent = requests.load(SeqCst);
+        assert!(
+            sent >= 4,
+            "unknown EDNS flags and extra sections never coalesce: {sent} upstream requests for 4 clients"
+        );
         assert!(s.inflight().is_empty());
         peer.abort();
     }
@@ -5850,18 +6737,21 @@ mod tests {
         assert_eq!(u16::from(code(&a)), 16);
         assert_eq!(u16::from_be_bytes([a[4], a[5]]), 1);
 
-        for typ in [RecordType::AXFR, RecordType::IXFR, RecordType::Unknown(249)] {
-            let q = query("x.test", typ);
-            assert_eq!(code(&send(&s, &q.to_vec().unwrap()).await.unwrap()), ResponseCode::Refused);
+        // Over UDP no AXFR is defined. The rest are proxied, and here no upstream answers.
+        let axfr = query("x.test", RecordType::AXFR);
+        assert_eq!(code(&send(&s, &axfr.to_vec().unwrap()).await.unwrap()), ResponseCode::Refused);
+        for typ in [RecordType::IXFR, RecordType::Unknown(249)] {
+            let q = query("x.example", typ);
+            assert_eq!(code(&send(&s, &q.to_vec().unwrap()).await.unwrap()), ResponseCode::ServFail);
         }
         let nxname = query("x.test", RecordType::Unknown(128));
         assert_eq!(code(&send(&s, &nxname.to_vec().unwrap()).await.unwrap()), ResponseCode::FormErr);
 
-        let signed = append_record(&query("x.test", RecordType::A).to_vec().unwrap(), 250, 255, 0, &[]);
-        assert_eq!(code(&send(&s, &signed).await.unwrap()), ResponseCode::Refused);
-        // SIG(0) is type 24 covering type 0; like TSIG it needs an authentication boundary.
-        let sig0 = append_record(&query("x.test", RecordType::A).to_vec().unwrap(), 24, 255, 0, &[0, 0]);
-        assert_eq!(code(&send(&s, &sig0).await.unwrap()), ResponseCode::Refused);
+        let signed = append_record(&query("x.example", RecordType::A).to_vec().unwrap(), 250, 255, 0, &[]);
+        assert_eq!(code(&send(&s, &signed).await.unwrap()), ResponseCode::ServFail);
+        // SIG(0) is type 24 covering type 0, and is proxied like TSIG.
+        let sig0 = append_record(&query("x.example", RecordType::A).to_vec().unwrap(), 24, 255, 0, &[0, 0]);
+        assert_eq!(code(&send(&s, &sig0).await.unwrap()), ResponseCode::ServFail);
 
         let mut duplicate = query("x.test", RecordType::A).to_vec().unwrap();
         duplicate = append_record(&duplicate, 41, 1232, 0, &[]);
@@ -6960,7 +7850,8 @@ mod tests {
             // hickory names wire RCODE 16 BADSIG; compare the number.
             assert_eq!(u16::from(code(&answer)), 16, "{raw}");
         }
-        // Version 0 keeps the opcode/QTYPE table: AXFR is REFUSED, NXNAME is FORMERR.
+        // Version 0 keeps the opcode/QTYPE table: AXFR outside the TCP stream path
+        // is REFUSED, NXNAME is FORMERR.
         let axfr = send(&s, &hex("0d0d0100000100000000000104746573740000fc000100002904d0000000000000")).await.unwrap();
         assert_eq!(code(&axfr), ResponseCode::Refused);
         let nxname =
@@ -7050,23 +7941,6 @@ mod tests {
         assert_eq!(u16::from(code(&answer)), 16);
         let answer = send(&s, &hex("00070100000000000000000100002904d0000000000000")).await.unwrap();
         assert_eq!(code(&answer), ResponseCode::Refused);
-    }
-
-    #[tokio::test]
-    async fn meta_qtypes_are_formerr_and_never_forwarded() {
-        // RFC 6895 §3.1 (found by differential fuzzing): OPT, TSIG and
-        // the 128-248 meta range never reach an upstream; MAILA/MAILB do.
-        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (addr, peer) = serve_udp(true, Duration::ZERO, requests.clone()).await;
-        let s = upstream_server(addr);
-        for qtype in [41u16, 129, 200, 248, 250] {
-            let mut raw = hex("0d0d01000001000000000000016404746573740000c80001");
-            raw[20..22].copy_from_slice(&qtype.to_be_bytes());
-            let answer = send(&s, &raw).await.expect("a reply");
-            assert_eq!(code(&answer), ResponseCode::FormErr, "qtype {qtype}");
-        }
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
-        peer.abort();
     }
 
     #[tokio::test]
@@ -8021,5 +8895,850 @@ mod tests {
         guard.complete(None);
         assert_eq!(code(&tcp.await.unwrap().unwrap()), ResponseCode::ServFail, "the TCP query followed");
         holder.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rfc_tests {
+    use super::*;
+    use hickory_proto::op::Query;
+    use hickory_proto::rr::rdata::opt::EdnsOption;
+
+    fn server(cfg: Config) -> Arc<Server> {
+        let r = rules::Rules::from_lines(&cfg.user_rules, 0);
+        let upstreams = Arc::new(UpstreamPool::new(&cfg).unwrap());
+        let lists = ListManager::new(lists::client_builder().build().unwrap(), &cfg);
+        let runtime = Arc::new(Runtime::build(cfg, Arc::new(r), Arc::new(Vec::new()), upstreams, lists));
+        Arc::new(Server {
+            runtime: arc_swap::ArcSwap::from(runtime),
+            ready: AtomicBool::new(true),
+            udp_dropped: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            udp_truncated: AtomicU64::new(0),
+            parse_calls: std::sync::atomic::AtomicUsize::new(0),
+            tcp_spawns: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "conformance-adapter")]
+            packets: adapter::Packets::default(),
+            udp_permits: std::sync::OnceLock::new(),
+            refresh_now: Notify::new(),
+            probe: Mutex::new(None),
+        })
+    }
+
+    fn query(name: &str, typ: RecordType, payload: Option<u16>, dnssec_ok: bool) -> Message {
+        let mut q = Message::new(42, MessageType::Query, OpCode::Query);
+        q.metadata.recursion_desired = true;
+        q.add_query(Query::query(Name::from_ascii(format!("{}.", name.trim_end_matches('.'))).unwrap(), typ));
+        if let Some(payload) = payload {
+            let edns = q.edns.get_or_insert_with(Default::default);
+            edns.set_max_payload(payload);
+            edns.set_dnssec_ok(dnssec_ok);
+        }
+        q
+    }
+
+    /// Caches `records` A records for `q`, plus an RRSIG when `signed`.
+    fn cache_a(s: &Arc<Server>, q: &Message, records: usize, signed: bool) {
+        let raw = q.to_vec().unwrap();
+        let view = wire::parse_query(&raw).unwrap();
+        let mut buffer = [0u8; wire::MIN_CANONICAL_BUFFER];
+        let len = wire::canonical_key(&view, &mut buffer).unwrap();
+        let mut answer = reply(q, ResponseCode::NoError);
+        for i in 0..records {
+            answer.add_answer(Record::from_rdata(
+                q.queries[0].name().clone(),
+                60,
+                RData::A(A::new(192, 0, 2, (i % 250) as u8)),
+            ));
+        }
+        if signed {
+            answer.add_answer(Record::from_rdata(
+                q.queries[0].name().clone(),
+                60,
+                RData::Unknown { code: RecordType::RRSIG, rdata: hickory_proto::rr::rdata::NULL::with(vec![0; 40]) },
+            ));
+        }
+        let full = answer.to_vec().unwrap();
+        assert!(s.cache().insert(&buffer[..len], &full, &answer, 0));
+    }
+
+    fn no_upstream() -> Config {
+        Config { upstreams: vec![], fallback: vec![], cache_size: 64, forward_test_names: true, ..Config::default() }
+    }
+
+    const LOCALHOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn rfc9715_s182_udp_listeners_set_dont_fragment_where_it_is_safe() {
+        use nix::sys::socket::{getsockopt, sockopt};
+        let v6 = bind_udp_socket("[::1]:0".parse().unwrap(), false, 0, 0).unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(getsockopt(&v6, sockopt::Ipv6DontFrag).unwrap(), "IPv6 replies are never fragmented");
+        let v4 = bind_udp_socket("127.0.0.1:0".parse().unwrap(), false, 0, 0).unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(getsockopt(&v4, sockopt::IpDontFrag).unwrap(), "IPv4 DF where it needs no path MTU discovery");
+        let _ = (v6, v4);
+    }
+
+    /// macOS loopback has a 16384-octet MTU, so a larger reply under the
+    /// don't-fragment flag fails with EMSGSIZE and must go again with TC set.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn rfc9715_s182_a_reply_the_path_refuses_goes_again_with_tc() {
+        let server = UdpSocket::from_std(bind_udp_socket("[::1]:0".parse().unwrap(), false, 0, 0).unwrap()).unwrap();
+        let client = std::net::UdpSocket::bind("[::1]:0").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // "big.test" TXT reply, no answers, one OPT with a 20000-octet option.
+        let mut big = vec![
+            0x97, 0x15, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 1, 3, b'b', b'i', b'g', 4, b't', b'e', b's', b't', 0, 0, 16,
+            0, 1,
+        ];
+        big.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0]);
+        big.extend_from_slice(&20_004u16.to_be_bytes());
+        big.extend_from_slice(&[0xff, 0x00, 0x4e, 0x20]);
+        big.extend(std::iter::repeat_n(0u8, 20_000));
+        send_reply(&server, &big, client.local_addr().unwrap(), None).await;
+        let mut buf = vec![0u8; 65_536];
+        let n = client.recv(&mut buf).expect("a reply must arrive");
+        let m = Message::from_vec(&buf[..n]).unwrap();
+        assert!(m.metadata.truncation, "TC tells the client to retry over TCP");
+        assert!(m.answers.is_empty() && m.authorities.is_empty());
+        let edns = m.edns.expect("the OPT stays");
+        assert_eq!((edns.max_payload(), edns.flags().dnssec_ok), (1232, true), "payload and DO kept");
+        assert_eq!(m.queries[0].name().to_ascii(), "big.test.");
+    }
+
+    #[tokio::test]
+    async fn rfc2181_s159_reply_falls_back_to_a_usable_source_when_the_chosen_one_is_not_permitted() {
+        let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // 192.0.2.1 (TEST-NET-1) is not assigned to this host, so sending from it fails.
+        let unusable: IpAddr = "192.0.2.1".parse().unwrap();
+        send_reply(&server, b"reply", client.local_addr().unwrap(), Some(unusable)).await;
+        let mut buf = [0u8; 16];
+        let (n, from) = client.recv_from(&mut buf).expect("the reply must still reach the client");
+        assert_eq!(&buf[..n], b"reply");
+        // The reply comes from the port the client queried, from an address it can reach.
+        assert_eq!(from.port(), server.local_addr().unwrap().port());
+        assert_ne!(from.ip(), unusable);
+    }
+
+    #[tokio::test]
+    async fn rfc4035_s546_signed_answer_is_complete_with_its_rrsig_or_sets_tc() {
+        let s = server(no_upstream());
+        // Fits: the RRSIG must travel with its RRset.
+        let small = query("sig-small.test", RecordType::A, Some(4096), true);
+        cache_a(&s, &small, 3, true);
+        // Does not fit 512 octets: the whole signed RRset with its RRSIG, or TC.
+        let large = query("sig-large.test", RecordType::A, Some(512), true);
+        cache_a(&s, &large, 60, true);
+        for q in [&small, &large] {
+            let raw = s.handle(&q.to_vec().unwrap(), LOCALHOST, true).await.unwrap();
+            let m = Message::from_vec(&raw).unwrap();
+            let has = |t: RecordType| m.answers.iter().any(|r| r.record_type() == t);
+            let complete = has(RecordType::A) && has(RecordType::RRSIG);
+            let truncated = m.metadata.truncation && m.answers.is_empty();
+            assert!(complete || truncated, "{}: A without its RRSIG and no TC", q.queries[0].name());
+            if q.edns.as_ref().unwrap().max_payload() == 4096 {
+                assert!(complete, "a signed answer that fits carries its RRSIG");
+            } else {
+                assert!(raw.len() <= 512);
+            }
+        }
+    }
+
+    /// RFC 4035 §3.1.1: RRSIGs outrank every other RRset for inclusion. A
+    /// signed answer that fits 512 octets on its own, cached with Additional
+    /// data that does not, keeps its RRSIG and loses the Additional data,
+    /// with TC clear.
+    #[tokio::test]
+    async fn rfc4035_s546_rrsig_outranks_additional_data() {
+        let s = server(no_upstream());
+        let q = query("sig-glue.test", RecordType::A, Some(512), true);
+        let raw = q.to_vec().unwrap();
+        let view = wire::parse_query(&raw).unwrap();
+        let mut key = [0u8; wire::MIN_CANONICAL_BUFFER];
+        let len = wire::canonical_key(&view, &mut key).unwrap();
+        let owner = q.queries[0].name().clone();
+        let mut answer = reply(&q, ResponseCode::NoError);
+        answer.add_answer(Record::from_rdata(owner.clone(), 60, RData::A(A::new(192, 0, 2, 1))));
+        answer.add_answer(Record::from_rdata(
+            owner,
+            60,
+            RData::Unknown { code: RecordType::RRSIG, rdata: hickory_proto::rr::rdata::NULL::with(vec![0; 40]) },
+        ));
+        for i in 0..30u8 {
+            let glue = Name::from_ascii(format!("glue{i}.sig-glue.test.")).unwrap();
+            answer.add_additional(Record::from_rdata(glue, 60, RData::A(A::new(192, 0, 2, i))));
+        }
+        let full = answer.to_vec().unwrap();
+        assert!(full.len() > 512, "the whole message does not fit");
+        assert!(s.cache().insert(&key[..len], &full, &answer, 0));
+        let got = s.handle(&raw, LOCALHOST, true).await.unwrap();
+        assert!(got.len() <= 512);
+        let m = Message::from_vec(&got).unwrap();
+        assert!(!m.metadata.truncation, "the required data is all there");
+        let types: Vec<RecordType> = m.answers.iter().map(|r| r.record_type()).collect();
+        assert_eq!(types, [RecordType::A, RecordType::RRSIG], "the RRSIG travels with its RRset");
+        assert!(m.additionals.iter().all(|r| r.record_type() == RecordType::OPT), "Additional data goes first");
+    }
+
+    #[tokio::test]
+    async fn rfc7830_s158_padding_query_never_yields_a_reply_beyond_the_requestor_payload() {
+        let s = server(no_upstream());
+        let mut q = query("pad.test", RecordType::A, Some(512), false);
+        q.edns.as_mut().unwrap().options_mut().insert(EdnsOption::Unknown(12, vec![0; 64]));
+        cache_a(&s, &q, 60, false);
+        let raw = s.handle(&q.to_vec().unwrap(), LOCALHOST, true).await.unwrap();
+        assert!(raw.len() <= 512, "{} octets exceed the requestor payload of 512", raw.len());
+        assert!(Message::from_vec(&raw).unwrap().metadata.truncation);
+    }
+
+    #[test]
+    fn rfc9715_s180_default_udp_payload_fits_the_ipv6_minimum_mtu_without_fragmentation() {
+        // IPv6 header 40 + UDP header 8 on a 1280-octet minimum MTU (RFC 8200 section 5).
+        assert!(usize::from(Config::default().udp_max_payload) + 40 + 8 <= 1280);
+    }
+
+    #[tokio::test]
+    async fn rfc9715_s180_oversized_answer_for_a_large_edns_client_is_truncated_not_fragmented() {
+        let s = server(no_upstream());
+        let q = query("frag.test", RecordType::A, Some(4096), false);
+        cache_a(&s, &q, 120, false);
+        let raw = s.handle(&q.to_vec().unwrap(), LOCALHOST, true).await.unwrap();
+        let limit = usize::from(s.runtime().cfg.udp_max_payload);
+        assert!(raw.len() <= limit && limit + 48 <= 1280, "datagram of {} octets", raw.len());
+        assert!(Message::from_vec(&raw).unwrap().metadata.truncation);
+    }
+
+    #[tokio::test]
+    async fn rfc9715_s212_upstream_request_advertises_at_most_1400() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let _peer = tokio::spawn(async move {
+            loop {
+                let mut buf = vec![0u8; 65535];
+                let Ok((n, peer)) = socket.recv_from(&mut buf).await else { return };
+                let Ok(q) = Message::from_vec(&buf[..n]) else { continue };
+                log.lock().unwrap().push(q.edns.as_ref().map(hickory_proto::op::Edns::max_payload));
+                let mut answer = reply(&q, ResponseCode::NoError);
+                answer.add_answer(Record::from_rdata(q.queries[0].name().clone(), 60, RData::A(A::new(192, 0, 2, 1))));
+                let _ = socket.send_to(&answer.to_vec().unwrap(), peer).await;
+            }
+        });
+        let s = server(Config { udp_max_payload: 4096, upstreams: vec![], fallback: vec![addr], ..no_upstream() });
+        for (i, offer) in [4096u16, 1232, 512].into_iter().enumerate() {
+            let q = query(&format!("req{i}.test"), RecordType::A, Some(offer), false);
+            s.handle(&q.to_vec().unwrap(), LOCALHOST, true).await.unwrap();
+        }
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() >= 3, "{seen:?}");
+        for payload in seen.iter() {
+            assert!(payload.is_some_and(|p| p <= 1400), "upstream request advertised {payload:?}");
+        }
+    }
+
+    /// RFC 5625 §3: an unknown client option is forwarded unchanged inside our
+    /// own OPT. RFC 6891 §6.1.1: the client's OPT RR itself is not forwarded.
+    /// Hop-scoped options (here Padding) stop at the forwarder.
+    #[tokio::test]
+    async fn rfc5625_s162_unknown_client_options_are_forwarded_without_hop_options() {
+        const MARK: &[u8] = b"client-opt-marker";
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let log = seen.clone();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let _peer = tokio::spawn(async move {
+            loop {
+                let mut buf = vec![0u8; 65535];
+                let Ok((n, peer)) = socket.recv_from(&mut buf).await else { return };
+                let Ok(q) = Message::from_vec(&buf[..n]) else { continue };
+                log.lock().unwrap().push(buf[..n].to_vec());
+                let mut answer = reply(&q, ResponseCode::NoError);
+                answer.add_answer(Record::from_rdata(q.queries[0].name().clone(), 60, RData::A(A::new(192, 0, 2, 1))));
+                let _ = socket.send_to(&answer.to_vec().unwrap(), peer).await;
+            }
+        });
+        let s = server(Config { upstreams: vec![], fallback: vec![addr], ..no_upstream() });
+        let mut q = query("opt-fwd.test", RecordType::A, Some(1232), false);
+        q.edns.as_mut().unwrap().options_mut().insert(EdnsOption::Unknown(65001, MARK.to_vec()));
+        q.edns.as_mut().unwrap().options_mut().insert(EdnsOption::Unknown(12, vec![0; 8]));
+        let client_raw = q.to_vec().unwrap();
+        let has_mark = |raw: &[u8]| raw.windows(MARK.len()).any(|w| w == MARK);
+        assert!(has_mark(&client_raw), "control: the client query carries the option");
+        s.handle(&client_raw, LOCALHOST, true).await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "the query reached the upstream");
+        for raw in seen.iter() {
+            let view = wire::parse_query(raw).unwrap();
+            assert!(view.edns_present, "the upstream request has its own OPT");
+            assert!(has_mark(raw), "the unknown option was not forwarded: {raw:02x?}");
+            assert!(view.edns_options, "the unknown option was not forwarded: {raw:02x?}");
+            assert!(!view.edns_hop_options, "a hop-scoped option was forwarded: {raw:02x?}");
+            assert!(!raw.windows(4).any(|w| w == [0, 12, 0, 8]), "Padding bytes forwarded: {raw:02x?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rfc_tests_wire {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn server_for(upstream: SocketAddr) -> Arc<Server> {
+        server_with(Config {
+            upstreams: vec![],
+            fallback: vec![upstream],
+            forward_test_names: true,
+            ..Config::default()
+        })
+    }
+
+    fn server_with(cfg: Config) -> Arc<Server> {
+        let r = rules::Rules::from_lines(&cfg.user_rules, 0);
+        let upstreams = Arc::new(UpstreamPool::new(&cfg).unwrap());
+        let lists = ListManager::new(lists::client_builder().build().unwrap(), &cfg);
+        let runtime = Arc::new(Runtime::build(cfg, Arc::new(r), Arc::new(Vec::new()), upstreams, lists));
+        Arc::new(Server {
+            runtime: arc_swap::ArcSwap::from(runtime),
+            ready: AtomicBool::new(true),
+            udp_dropped: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            udp_truncated: AtomicU64::new(0),
+            parse_calls: std::sync::atomic::AtomicUsize::new(0),
+            tcp_spawns: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "conformance-adapter")]
+            packets: adapter::Packets::default(),
+            udp_permits: std::sync::OnceLock::new(),
+            refresh_now: Notify::new(),
+            probe: Mutex::new(None),
+        })
+    }
+
+    /// A root-owned record, as TSIG, SIG(0) and TKEY travel in Additional.
+    fn root_record(rtype: u16, rdata: &[u8]) -> Vec<u8> {
+        let mut out = vec![0];
+        out.extend_from_slice(&rtype.to_be_bytes());
+        out.extend_from_slice(&255u16.to_be_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(rdata);
+        out
+    }
+
+    /// RFC 5625 §4.5: any change to a signed message breaks its signature, so
+    /// it goes upstream and comes back exactly as it was. TKEY is proxied the
+    /// same way. Nothing is cached.
+    #[tokio::test]
+    async fn rfc5625_s362_s366_signed_and_tkey_messages_pass_unchanged() {
+        for (rtype, qtype) in [(250u16, 1u16), (24, 1), (249, 249)] {
+            let mut sent = query_bytes(0x4444, 0x0100, "t.test", qtype, 1);
+            sent[11] = 1;
+            // A SIG(0) covers type 0, in its first two bytes.
+            sent.extend(root_record(rtype, &[0, 0, 3]));
+            let p = peer(move |query| {
+                let mut reply = response_head(query, 0x8180, 0, 1);
+                reply.extend(root_record(rtype, &[0, 0, 6]));
+                vec![reply]
+            })
+            .await;
+            let s = server_for(p.addr);
+            let answer = ask(&s, &sent).await.unwrap();
+            let mut expected = response_head(&sent, 0x8180, 0, 1);
+            expected.extend(root_record(rtype, &[0, 0, 6]));
+            assert_eq!(answer, expected, "type {rtype}: the reply is relayed unchanged");
+            assert_eq!(p.seen.lock().unwrap().as_slice(), [sent.clone()], "type {rtype}: the query is sent unchanged");
+            ask(&s, &sent).await.unwrap();
+            assert_eq!(p.seen.lock().unwrap().len(), 2, "type {rtype}: not cached");
+        }
+    }
+
+    /// A signed query goes upstream verbatim, but under the same per-host cap
+    /// (`upstream_inflight_per_client`) as a cache miss: a host over it gets
+    /// TC=1 over UDP and SERVFAIL over TCP, and nothing more goes upstream.
+    #[tokio::test]
+    async fn signed_queries_count_against_the_per_host_upstream_cap() {
+        let mut sent = query_bytes(0x4444, 0x0100, "t.test", 1, 1);
+        sent[11] = 1;
+        sent.extend(root_record(250, &[0, 0, 3]));
+        let p = peer(|_| vec![]).await; // never answers: the first query holds the slot
+        let s = server_with(Config {
+            upstreams: vec![],
+            fallback: vec![p.addr],
+            forward_test_names: true,
+            upstream_inflight_per_client: 1,
+            ..Config::default()
+        });
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let held = {
+            let (s, sent) = (s.clone(), sent.clone());
+            tokio::spawn(async move { s.handle(&sent, ip, false).await })
+        };
+        for _ in 0..200 {
+            if !p.seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(p.seen.lock().unwrap().len(), 1, "the first signed query is upstream");
+        let udp = s.handle(&sent, ip, true).await.unwrap();
+        assert_ne!(udp[2] & 0x02, 0, "over UDP the host over its cap gets TC=1");
+        assert_eq!(&udp[6..12], [0; 6], "and no records");
+        let tcp = s.handle(&sent, ip, false).await.unwrap();
+        assert_eq!(tcp[3] & 0x0f, 2, "over TCP it gets SERVFAIL");
+        assert_eq!(p.seen.lock().unwrap().len(), 1, "neither reached the upstream");
+        held.abort();
+    }
+
+    /// RFC 5625 §4.4: a signed reply larger than the UDP client's limit cannot
+    /// be trimmed without breaking its signature, so it comes back with TC set
+    /// and no records, and the client retries over TCP.
+    #[tokio::test]
+    async fn an_oversized_signed_reply_over_udp_is_truncated() {
+        let mut sent = query_bytes(0x4444, 0x0100, "t.test", 1, 1);
+        sent[11] = 1;
+        sent.extend(root_record(250, &[0, 0, 3]));
+        let p = peer(|query| {
+            let mut reply = response_head(query, 0x8180, 0, 1);
+            reply.extend(root_record(250, &[7; 1000]));
+            vec![reply]
+        })
+        .await;
+        let s = server_for(p.addr);
+        let answer = s.handle(&sent, "127.0.0.1".parse().unwrap(), true).await.unwrap();
+        assert!(answer.len() <= 512, "a client without EDNS gets at most 512 bytes");
+        assert_ne!(answer[2] & 0x02, 0, "TC is set");
+        assert_eq!(&answer[6..12], [0; 6], "no records");
+        let full = ask(&s, &sent).await.unwrap();
+        assert!(full.len() > 1000, "over TCP the whole signed reply is relayed");
+    }
+
+    /// RFC 8945 §5.2: a duplicate TSIG, or a TSIG before another record, is
+    /// answered FORMERR over UDP and TCP and never forwarded.
+    #[tokio::test]
+    async fn rfc8945_s474_a_misplaced_or_repeated_tsig_is_formerr() {
+        let p = peer(|_| vec![]).await;
+        let s = server_for(p.addr);
+        let base = query_bytes(0x4444, 0x0100, "t.test", 1, 1);
+        let mut twice = base.clone();
+        twice[11] = 2;
+        twice.extend(root_record(250, &[0, 0, 3]));
+        twice.extend(root_record(250, &[0, 0, 3]));
+        let mut misplaced = base;
+        misplaced[11] = 2;
+        misplaced.extend(root_record(250, &[0, 0, 3]));
+        misplaced.extend(root_record(16, &[1, b'x']));
+        for (what, raw) in [("duplicate", twice), ("not last", misplaced)] {
+            for udp in [true, false] {
+                let answer = s.handle(&raw, "127.0.0.1".parse().unwrap(), udp).await.unwrap();
+                assert_eq!(answer[3] & 0x0f, ResponseCode::FormErr.low(), "{what}, udp={udp}");
+            }
+        }
+        assert!(p.seen.lock().unwrap().is_empty(), "nothing reaches the upstream");
+    }
+
+    /// Name policy comes first: a signature does not get a name past it.
+    #[tokio::test]
+    async fn a_signed_query_for_a_local_name_is_refused_and_not_forwarded() {
+        let p = peer(|_| vec![]).await;
+        let s = server_for(p.addr);
+        let mut sent = query_bytes(0x4444, 0x0100, "x.onion", 1, 1);
+        sent[11] = 1;
+        sent.extend(root_record(250, &[1, 2, 3]));
+        let answer = ask(&s, &sent).await.unwrap();
+        assert_eq!(answer[3] & 0x0f, ResponseCode::Refused.low());
+        assert!(p.seen.lock().unwrap().is_empty());
+    }
+
+    /// RFC 9824 §3.5 and W3: a signature does not bypass the protocol rules.
+    #[tokio::test]
+    async fn a_signed_nxname_or_nonquery_opcode_is_a_local_error() {
+        let p = peer(|_| vec![]).await;
+        let s = server_for(p.addr);
+        let mut nx = query_bytes(0x4444, 0x0100, "t.test", 128, 1);
+        nx[11] = 1;
+        nx.extend(root_record(250, &[1, 2, 3]));
+        let answer = ask(&s, &nx).await.unwrap();
+        assert_eq!(answer[3] & 0x0f, ResponseCode::FormErr.low(), "signed NXNAME");
+        let mut update = query_bytes(0x5555, 0x2000, "t.test", 1, 1); // opcode 4, UPDATE
+        update[11] = 1;
+        update.extend(root_record(250, &[1, 2, 3]));
+        let answer = ask(&s, &update).await.unwrap();
+        assert_eq!(answer[3] & 0x0f, ResponseCode::NotImp.low(), "signed UPDATE opcode");
+        assert!(p.seen.lock().unwrap().is_empty(), "neither reached the upstream");
+    }
+
+    /// A UDP upstream that records every query it receives and sends back
+    /// whatever datagrams `respond` builds for it.
+    struct Peer {
+        addr: SocketAddr,
+        seen: Arc<StdMutex<Vec<Vec<u8>>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Peer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    async fn peer(respond: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + Sync + 'static) -> Peer {
+        // UDP and TCP on one port, sharing the responder and the record of
+        // queries seen (verbatim exchanges go upstream over TCP).
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let listener = TcpListener::bind(addr).await.unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let respond = Arc::new(respond);
+        let task = tokio::spawn({
+            let (seen, respond) = (seen.clone(), respond.clone());
+            async move {
+                tokio::spawn({
+                    let (seen, respond) = (seen.clone(), respond.clone());
+                    async move {
+                        while let Ok((mut stream, _)) = listener.accept().await {
+                            let (seen, respond) = (seen.clone(), respond.clone());
+                            tokio::spawn(async move {
+                                while let Ok(len) = stream.read_u16().await {
+                                    let mut query = vec![0; usize::from(len)];
+                                    if stream.read_exact(&mut query).await.is_err() {
+                                        return;
+                                    }
+                                    seen.lock().unwrap().push(query.clone());
+                                    for message in respond(&query) {
+                                        let mut framed = (message.len() as u16).to_be_bytes().to_vec();
+                                        framed.extend_from_slice(&message);
+                                        if stream.write_all(&framed).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+                let mut buf = vec![0; 65535];
+                while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                    seen.lock().unwrap().push(buf[..n].to_vec());
+                    for datagram in respond(&buf[..n]) {
+                        socket.send_to(&datagram, from).await.unwrap();
+                    }
+                }
+            }
+        });
+        Peer { addr, seen, task }
+    }
+
+    /// Header and question of `sent` as the start of a response with the
+    /// given flags and counts (question bytes copied, so 0x20 case is echoed).
+    fn response_head(sent: &[u8], flags: u16, an: u16, ar: u16) -> Vec<u8> {
+        let mut end = 12;
+        while sent[end] != 0 {
+            end += sent[end] as usize + 1;
+        }
+        end += 5;
+        let mut out = sent[..end].to_vec();
+        out[2..4].copy_from_slice(&flags.to_be_bytes());
+        out[6..8].copy_from_slice(&an.to_be_bytes());
+        out[8..12].copy_from_slice(&[0, 0, (ar >> 8) as u8, ar as u8]);
+        out
+    }
+    fn record(rtype: u16, class: u16, ttl: u32, rdata: &[u8]) -> Vec<u8> {
+        let mut out = vec![0xc0, 0x0c];
+        out.extend_from_slice(&rtype.to_be_bytes());
+        out.extend_from_slice(&class.to_be_bytes());
+        out.extend_from_slice(&ttl.to_be_bytes());
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(rdata);
+        out
+    }
+    fn question(name: &str, qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in name.split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&qtype.to_be_bytes());
+        out.extend_from_slice(&qclass.to_be_bytes());
+        out
+    }
+    fn query_bytes(id: u16, flags: u16, name: &str, qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut raw = vec![(id >> 8) as u8, id as u8, (flags >> 8) as u8, flags as u8, 0, 1, 0, 0, 0, 0, 0, 0];
+        raw.extend_from_slice(&question(name, qtype, qclass));
+        raw
+    }
+    async fn ask(s: &Arc<Server>, raw: &[u8]) -> Option<Vec<u8>> {
+        s.handle(raw, "127.0.0.1".parse().unwrap(), false).await
+    }
+
+    fn opt(options: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut rdata = Vec::new();
+        for (code, data) in options {
+            rdata.extend_from_slice(&code.to_be_bytes());
+            rdata.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(data);
+        }
+        let mut out = vec![0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0];
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(&rdata);
+        out
+    }
+    fn query_opts(name: &str, options: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut raw = query_bytes(0x2222, 0x0100, name, 1, 1);
+        raw[11] = 1;
+        raw.extend_from_slice(&opt(options));
+        raw
+    }
+    fn answer_a(sent: &[u8]) -> Vec<Vec<u8>> {
+        let mut r = response_head(sent, 0x8180, 1, 0);
+        r.extend(record(1, 1, 300, &[192, 0, 2, 1]));
+        vec![r]
+    }
+    fn rcode(answer: &[u8]) -> u8 {
+        answer[3] & 0x0f
+    }
+
+    /// RFC 5625 section 6.3: a malformed query must get a synthesised error
+    /// response, not be dropped. Every shape with a readable header is
+    /// answered (FORMERR, the same ID, QR set), never forwarded.
+    #[tokio::test]
+    async fn rfc5625_s554_malformed_query_gets_an_error_response_not_a_drop() {
+        let p = peer(answer_a).await;
+        let s = server_for(p.addr);
+        let good = query_bytes(0xabcd, 0x0100, "bad.test", 1, 1);
+        let mut shapes: Vec<(&str, Vec<u8>)> = Vec::new();
+        shapes.push(("truncated question", good[..15].to_vec()));
+        shapes.push(("missing question type and class", good[..good.len() - 4].to_vec()));
+        let mut v = good.clone();
+        v[4..6].copy_from_slice(&5u16.to_be_bytes());
+        shapes.push(("qdcount larger than data", v));
+        let mut v = good.clone();
+        v.extend_from_slice(&[1, 2, 3, 4, 5]);
+        shapes.push(("trailing garbage", v));
+        let mut v = good.clone();
+        v[10..12].copy_from_slice(&3u16.to_be_bytes());
+        shapes.push(("arcount larger than data", v));
+        let mut v = good.clone();
+        v[6..8].copy_from_slice(&2u16.to_be_bytes());
+        shapes.push(("ancount larger than data", v));
+        let mut v = good.clone();
+        v[8..10].copy_from_slice(&9u16.to_be_bytes());
+        shapes.push(("nscount larger than data", v));
+        let mut v = good.clone();
+        v[12] = 63;
+        shapes.push(("label overruns the packet", v));
+        let mut v = good[..12].to_vec();
+        v.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+        shapes.push(("compression pointer loop", v));
+        let mut v = good.clone();
+        v[11] = 1;
+        v.extend_from_slice(&[0, 0, 41, 4, 0xd0, 0, 0, 0, 0, 0, 3, 0, 12]);
+        shapes.push(("truncated OPT option", v));
+        for (what, raw) in &shapes {
+            let answer = ask(&s, raw).await.unwrap_or_else(|| panic!("{what}: dropped instead of answered"));
+            assert_eq!(&answer[..2], &[0xab, 0xcd], "{what}: ID");
+            assert!(answer[2] & 0x80 != 0, "{what}: QR");
+            assert_eq!(rcode(&answer), 1, "{what}: FORMERR");
+        }
+        assert!(p.seen.lock().unwrap().is_empty(), "a malformed query reached the upstream");
+        // The one documented drop: no complete header, nothing to answer with.
+        assert!(ask(&s, &good[..11]).await.is_none());
+    }
+
+    /// RFC 7871 section 11.3: ECS options that are obviously forged or known
+    /// to be wrong are discarded. A malformed option is refused with FORMERR
+    /// (RFC 7871 section 6) and never forwarded; a well-formed one for an
+    /// unroutable address, like every client ECS, is dropped before
+    /// forwarding.
+    #[tokio::test]
+    async fn rfc7871_s1249_forged_client_ecs_is_discarded_before_forwarding() {
+        let p = peer(answer_a).await;
+        let s = server_for(p.addr);
+        let forged: [(&str, &[u8]); 6] = [
+            ("unknown family", &[0, 3, 24, 0, 192, 0, 2]),
+            ("bits set past the prefix", &[0, 1, 20, 0, 192, 0, 0x2f]),
+            ("nonzero scope in a query", &[0, 1, 24, 5, 192, 0, 2]),
+            ("address too short", &[0, 1, 24, 0, 192, 0]),
+            ("prefix longer than the family", &[0, 1, 33, 0, 192, 0, 2, 1, 1]),
+            ("no address fields at all", &[0, 1]),
+        ];
+        for (i, (what, data)) in forged.iter().enumerate() {
+            let answer = ask(&s, &query_opts(&format!("forged{i}.test"), &[(8, data)])).await.unwrap();
+            assert_eq!(rcode(&answer), 1, "{what}: FORMERR");
+        }
+        assert!(p.seen.lock().unwrap().is_empty(), "a forged ECS reached the upstream");
+        let unroutable: [(&str, &[u8]); 5] = [
+            ("loopback", &[0, 1, 24, 0, 127, 0, 0]),
+            ("private", &[0, 1, 8, 0, 10]),
+            ("link local v6", &[0, 2, 16, 0, 0xfe, 0x80]),
+            ("loopback v6", &[0, 2, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            ("routable", &[0, 1, 24, 0, 192, 0, 2]),
+        ];
+        for (i, (what, data)) in unroutable.iter().enumerate() {
+            let answer = ask(&s, &query_opts(&format!("ecs{i}.test"), &[(8, data)])).await.unwrap();
+            assert_eq!(rcode(&answer), 0, "{what}: answered");
+            let sent = p.seen.lock().unwrap().last().unwrap().clone();
+            let view = wire::parse_query(&sent).unwrap();
+            assert!(view.edns_present, "{what}: our own OPT");
+            assert!(!view.edns_options && !view.edns_hop_options, "{what}: ECS was forwarded");
+            assert!(!sent.windows(4).any(|w| w == [0, 8, 0, data.len() as u8]), "{what}: ECS bytes forwarded");
+        }
+        assert_eq!(p.seen.lock().unwrap().len(), unroutable.len());
+    }
+
+    /// RFC 9267 section 6 (citing RFC 5625 section 6.3): a malformed packet
+    /// from the upstream is dropped; a valid reply that follows is the one
+    /// used.
+    #[tokio::test]
+    async fn rfc9267_s577_malformed_upstream_reply_is_dropped_and_later_valid_one_used() {
+        for variant in 0..6u8 {
+            let p = peer(move |sent| {
+                let mut valid = response_head(sent, 0x8180, 1, 0);
+                valid.extend(record(1, 1, 300, &[192, 0, 2, 7]));
+                // Same shape as the valid reply but a different address, so a
+                // reply built from the malformed packet cannot go unnoticed.
+                let mut bad = response_head(sent, 0x8180, 1, 0);
+                bad.extend(record(1, 1, 300, &[192, 0, 2, 66]));
+                match variant {
+                    0 => bad[6..8].copy_from_slice(&5u16.to_be_bytes()),
+                    1 => bad[8..10].copy_from_slice(&3u16.to_be_bytes()),
+                    2 => bad[10..12].copy_from_slice(&2u16.to_be_bytes()),
+                    3 => bad[4..6].copy_from_slice(&3u16.to_be_bytes()),
+                    4 => bad.truncate(bad.len() - 2),
+                    _ => bad.extend_from_slice(&[9, 9, 9]),
+                }
+                vec![bad, valid]
+            })
+            .await;
+            let s = server_for(p.addr);
+            let answer = ask(&s, &query_bytes(0x3333, 0x0100, &format!("m{variant}.test"), 1, 1)).await.unwrap();
+            let parsed = Message::from_vec(&answer).unwrap();
+            assert_eq!(parsed.metadata.response_code, ResponseCode::NoError, "variant {variant}");
+            let address = parsed.answers.iter().find_map(|r| match &r.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            });
+            assert_eq!(address, Some("192.0.2.7".parse().unwrap()), "variant {variant}: the valid reply is used");
+            assert_eq!(parsed.answers.len(), 1, "variant {variant}");
+        }
+    }
+
+    /// RFC 6891 section 6.1.2: options have the same effect in any order.
+    /// Through the whole server path a malformed ECS gives FORMERR whether
+    /// it comes first, in the middle or last, and the same options in any
+    /// order give the same upstream query.
+    #[tokio::test]
+    async fn rfc6891_s431b_option_order_has_no_effect_through_the_server() {
+        fn orders(items: &[(u16, &'static [u8])]) -> Vec<Vec<(u16, &'static [u8])>> {
+            if items.len() <= 1 {
+                return vec![items.to_vec()];
+            }
+            let mut out = Vec::new();
+            for i in 0..items.len() {
+                let mut rest = items.to_vec();
+                let first = rest.remove(i);
+                for mut tail in orders(&rest) {
+                    tail.insert(0, first);
+                    out.push(tail);
+                }
+            }
+            out
+        }
+        let bad: (u16, &'static [u8]) = (8, &[0, 7, 24, 0, 192, 0, 2]);
+        let good: (u16, &'static [u8]) = (8, &[0, 1, 24, 0, 192, 0, 2]);
+        let padding: (u16, &'static [u8]) = (12, &[0, 0, 0, 0]);
+        let unknown: (u16, &'static [u8]) = (0xfde9, &[1, 2, 3]);
+        let p = peer(answer_a).await;
+        let s = server_for(p.addr);
+        let all = orders(&[bad, good, padding, unknown]);
+        for order in &all {
+            let answer = ask(&s, &query_opts("order.test", order)).await.unwrap();
+            assert_eq!(rcode(&answer), 1, "bad ECS in order {:?}", order.iter().map(|o| o.1[1]).collect::<Vec<_>>());
+        }
+        assert!(p.seen.lock().unwrap().is_empty());
+        let all = orders(&[good, padding, unknown, (10, &[1, 2, 3, 4, 5, 6, 7, 8])]);
+        for order in &all {
+            let answer = ask(&s, &query_opts("order.test", order)).await.unwrap();
+            assert_eq!(rcode(&answer), 0);
+        }
+        let seen = p.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 24, "every order is forwarded (options bypass the cache)");
+        // The random ID and 0x20 case differ per query; nothing else may.
+        let shape = |q: &[u8]| q[2..].to_ascii_lowercase();
+        for q in &seen {
+            assert_eq!(shape(q), shape(&seen[0]));
+        }
+    }
+    /// RFC 5625 section 3: a proxy should be as transparent as possible. An
+    /// unassigned QTYPE and QCLASS reach the upstream unchanged, and the
+    /// client gets the upstream reply byte for byte (only the client's own
+    /// ID and name case differ) for opaque RDATA of an unknown type, a known
+    /// type with no layout (HIP), valid LOC, DS and RRSIG, and an unassigned
+    /// class. The
+    /// documented exceptions are asserted too: the reserved Z bit is cleared
+    /// (RFC 1035 section 4.1.1) and EDNS options are hop by hop, so only
+    /// Extended DNS Error survives, re-attributed.
+    #[tokio::test]
+    async fn rfc5625_s162_proxy_is_transparent_for_unknown_types_classes_and_rdata() {
+        let cases: [(u16, u16, &[u8]); 7] = [
+            (65300, 1, &[1, 2, 3, 0xff, 0]),
+            (1, 0x1234, &[9, 9]),
+            (29, 1, &[0; 16]),
+            (55, 1, &[0]),
+            (43, 1, &[0x12, 0x34, 8, 2, 0xff]),
+            (46, 1, &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 9]),
+            (65301, 0x4321, &[]),
+        ];
+        for (n, (qtype, qclass, rdata)) in cases.into_iter().enumerate() {
+            let reply = std::sync::Arc::new(StdMutex::new(Vec::new()));
+            let p = peer({
+                let reply = reply.clone();
+                move |sent| {
+                    let mut r = response_head(sent, 0x8180, 1, 0);
+                    r.extend(record(qtype, qclass, 300, rdata));
+                    *reply.lock().unwrap() = r.clone();
+                    vec![r]
+                }
+            })
+            .await;
+            let s = server_for(p.addr);
+            let q = query_bytes(0x4444, 0x0100, "t.test", qtype, qclass);
+            let answer = ask(&s, &q).await.unwrap();
+            let sent = p.seen.lock().unwrap().last().unwrap().clone();
+            let tail = |m: &[u8]| m[12 + 8..].to_vec();
+            assert_eq!(tail(&sent)[..4], q[q.len() - 4..], "case {n}: QTYPE and QCLASS reach the upstream unchanged");
+            let mut expected = reply.lock().unwrap().clone();
+            expected[..2].copy_from_slice(&[0x44, 0x44]);
+            expected[12..12 + 8].copy_from_slice(&q[12..12 + 8]);
+            assert_eq!(answer, expected, "case {n}: client-visible message differs from the upstream reply");
+        }
+        // The reserved Z bit is the one header bit cleared on purpose.
+        let p = peer(|sent| {
+            let mut r = response_head(sent, 0x81c0, 1, 0);
+            r.extend(record(1, 1, 300, &[192, 0, 2, 1]));
+            vec![r]
+        })
+        .await;
+        let s = server_for(p.addr);
+        let answer = ask(&s, &query_bytes(0x4444, 0x0100, "z.test", 1, 1)).await.unwrap();
+        assert_eq!(&answer[2..4], &[0x81, 0x80]);
+        // EDNS: an unknown client option is forwarded unchanged (RFC 5625 §3);
+        // upstream options other than EDE are not relayed to the client.
+        let p = peer(|sent| {
+            let mut r = response_head(sent, 0x8180, 1, 1);
+            r.extend(record(1, 1, 300, &[192, 0, 2, 1]));
+            r.extend(opt(&[(0xfde9, &[0xff, 0, 1]), (15, &[0, 22])]));
+            vec![r]
+        })
+        .await;
+        let s = server_for(p.addr);
+        let answer = ask(&s, &query_opts("e.test", &[(0xfde9, &[1, 2, 3])])).await.unwrap();
+        let sent = p.seen.lock().unwrap().last().unwrap().clone();
+        assert!(sent.windows(4).any(|w| w == [0xfd, 0xe9, 0, 3]), "client option not forwarded");
+        assert_eq!(rcode(&answer), 0);
+        assert!(answer.ends_with(&[0, 15, 0, 10, 0, 22, b'u', b'p', b's', b't', b'r', b'e', b'a', b'm']));
+        assert!(!answer.windows(2).any(|w| w == [0xfd, 0xe9]), "upstream option relayed");
     }
 }

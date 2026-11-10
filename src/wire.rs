@@ -47,17 +47,24 @@ const OPT_TYPE: u16 = 41;
 const TSIG_TYPE: u16 = 250;
 const SIG0_TYPE: u16 = 24;
 /// Upper bounds for the terminal-answer classifier's CNAME/DNAME walk.
-const MAX_CHAIN_STEPS: usize = 16;
+pub(crate) const MAX_CHAIN_STEPS: usize = 16;
 const MAX_CHAIN_RECORDS: usize = 64;
-/// QTYPEs answered FORMERR locally, never forwarded: the reserved TYPE 0, the
-/// meta-TYPEs OPT (41) and TSIG (250) and the unassigned meta range 128-248,
-/// which includes NXNAME (RFC 6895 §3.1, RFC 9824 §3.5). TKEY (249) is REFUSED with the transfer
-/// types; MAILB/MAILA (253, 254) are QTYPEs and forward like any other.
+/// QTYPEs that name no stored data: the reserved TYPE 0, the meta-TYPEs OPT
+/// (41) and TSIG (250) and the unassigned meta range 128-248, which includes
+/// NXNAME (RFC 6895 §3.1). They are never cached. MAILB/MAILA (253, 254) are
+/// QTYPEs and forward like any other.
 pub fn is_meta_qtype(qtype: u16) -> bool {
     matches!(qtype, 0 | 41 | 250 | 128..=248)
 }
-/// QTYPEs that ask for a zone transfer or key exchange, refused locally.
+/// QTYPEs answered FORMERR locally. RFC 9824 §3.5 requires it for NXNAME.
+/// Every other QTYPE, OPT (41) included, is proxied (RFC 5625 §4.3).
+pub fn is_invalid_qtype(qtype: u16) -> bool {
+    qtype == 128
+}
+/// QTYPEs that ask for a zone transfer or key exchange. They are proxied
+/// unchanged, never through the normal path, which rebuilds the query.
 pub const TRANSFER_TYPES: [u16; 3] = [249, 251, 252]; // TKEY, IXFR, AXFR
+pub const AXFR_TYPE: u16 = 252;
 
 /// DNSSEC record types stripped from responses sent to DO=0 clients.
 const DNSSEC_TYPES: [u16; 8] = [43, 46, 47, 48, 50, 51, 59, 60];
@@ -187,7 +194,9 @@ fn read_name(raw: &[u8], start: usize, out: &mut [u8; MAX_NAME_LEN]) -> Option<N
 /// [`read_name`] with a choice of case and pointer rule: `fold == false` keeps
 /// the label bytes exactly as sent, for rewriting a name literally; `strict`
 /// also refuses a pointer into the header, which is not a prior name (RFC 1035
-/// §4.1.4). Responses are read strictly. Queries keep the lenient rule their
+/// §4.1.4), one to a root terminator, and a first pointer that lands on
+/// another pointer (RFC 9267 §2). Responses are read
+/// strictly. Queries keep the lenient rule their
 /// compressed-question handling is built on.
 fn read_name_with(
     raw: &[u8],
@@ -236,7 +245,11 @@ fn read_name_with(
                     end = Some(pos + 2);
                 }
                 let target = (((len & 0x3f) as usize) << 8) | (*raw.get(pos + 1)? as usize);
-                if target >= pos || (strict && target < HEADER_LEN) {
+                // RFC 9267 §2: the first pointer must land on a label length
+                // (1..=63), never on a root octet or another pointer.
+                if target >= pos
+                    || (strict && (target < HEADER_LEN || raw[target] == 0 || (jumps == 0 && raw[target] >= 64)))
+                {
                     return None;
                 }
                 jumps += 1;
@@ -434,7 +447,14 @@ pub fn parse_query(raw: &[u8]) -> Option<QueryView<'_>> {
     for _ in 0..head.ancount as usize + head.nscount as usize {
         pos = record_header(raw, pos, &mut scratch)?.end;
     }
+    // A signature closes the Additional section: TSIG must be last
+    // (RFC 8945 §5.2), and a message carries one TSIG or one SIG(0), never
+    // both (RFC 2931 §3). Anything after a signature makes the message
+    // malformed, not merely unsupported.
     for _ in 0..head.arcount {
+        if view.signed {
+            return None;
+        }
         let record = record_header(raw, pos, &mut scratch)?;
         if record.rtype == OPT_TYPE {
             // RFC 6891 §6.1.2: the OPT owner name is the root.
@@ -456,11 +476,8 @@ pub fn parse_query(raw: &[u8]) -> Option<QueryView<'_>> {
             view.has_non_opt_additional = true;
             // SIG(0) is a SIG with "type covered" 0 (RFC 2931 §3); a SIG that
             // covers a real type is ordinary RRset data, not authentication.
-            if record.rtype == TSIG_TYPE
-                || (record.rtype == SIG0_TYPE && raw.get(record.rdata..record.rdata + 2) == Some(&[0, 0]))
-            {
-                view.signed = true;
-            }
+            let sig0 = record.rtype == SIG0_TYPE && raw.get(record.rdata..record.rdata + 2) == Some(&[0, 0]);
+            view.signed = record.rtype == TSIG_TYPE || sig0;
         }
         pos = record.end;
     }
@@ -504,6 +521,46 @@ pub fn canonical_key(view: &QueryView<'_>, out: &mut [u8]) -> Option<usize> {
     }
     out[n + 4] = flags;
     Some(total)
+}
+
+/// True for a zone transfer that may go on to the stream path over TCP.
+/// Version negotiation and option checks come first, as for any query.
+pub fn is_zone_transfer(view: &QueryView<'_>) -> bool {
+    // A message with QR set is a response, never a transfer request: it is
+    // ignored like any response on the query listener (spec W3).
+    view.flags & QR_BIT == 0
+        && matches!(view.qtype, 251 | 252)
+        && view.opcode == 0
+        && view.edns_version == 0
+        && !view.edns_bad_ecs
+}
+
+/// True for a query `home_arpa_server` answers: `home.arpa` and below, except
+/// the DS with DO at the apex, whose proof lives in the public tree (RFC 8375
+/// §4).
+pub fn is_home_arpa_query(view: &QueryView<'_>) -> bool {
+    match suffix_offset(b"\x04home\x04arpa\0", &view.qname_lower[..view.qname_len as usize]) {
+        Some(0) => !(view.qtype == 43 && view.edns_do),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+/// Turns a [`canonical_key`] into the key of its name-level NXDOMAIN entry
+/// (RFC 2308 §8): QTYPE 0 and a flag no real query key has. The name, class
+/// and DO/CD/AD/EDNS context stay, so a DO client's denial proof stays with
+/// DO clients.
+pub fn name_error_key(key: &mut [u8]) {
+    let flags = key.len() - 1;
+    key[flags - 4..flags - 2].fill(0);
+    key[flags] |= 1 << 4;
+}
+
+/// Writes the client's QTYPE into a reply taken from a name-level entry.
+pub fn set_question_type(answer: &mut [u8], view: &QueryView<'_>) -> Option<()> {
+    let at = HEADER_LEN + view.qname_len as usize;
+    answer.get_mut(at..at + 2)?.copy_from_slice(&view.qtype.to_be_bytes());
+    Some(())
 }
 
 /// Writes the dot-separated, no-final-dot lowercased form of the question
@@ -727,9 +784,9 @@ fn zone_of(zone: &[u8], name: &[u8]) -> bool {
 /// Terminal means an NXDOMAIN with an authority SOA, a positive answer of the
 /// query type reachable through the chain, or a NOERROR NODATA with an
 /// authority SOA. Referrals, SOA-less negatives, chains that only carry
-/// CNAMEs, loops and other rcodes are not terminal. `None` means the packet
-/// is malformed or is not a response, or it contradicts itself: an
-/// NXDOMAIN whose Answer holds data other than aliases at the query name or
+/// CNAMEs and other rcodes are not terminal. `None` means the packet
+/// is malformed or is not a response, or it contradicts itself: an alias
+/// loop, an NXDOMAIN whose Answer holds data other than aliases at the query name or
 /// anywhere on its alias chain, or a NOERROR whose chain ends at a name that
 /// holds only other types.
 pub fn terminal_answer(raw: &[u8], qname_lower: &[u8], qtype: u16) -> Option<bool> {
@@ -835,8 +892,10 @@ pub fn terminal_answer(raw: &[u8], qname_lower: &[u8], qtype: u16) -> Option<boo
     let mut current: Box<[u8]> = qname_lower.into();
     let mut seen: Vec<Box<[u8]>> = Vec::new();
     for _ in 0..MAX_CHAIN_STEPS {
+        // RFC 1034 §3.6.2: an alias loop never reaches data. It is invalid,
+        // not merely uncacheable, so the attempt fails.
         if seen.iter().any(|seen| seen.as_ref() == current.as_ref()) {
-            return Some(false);
+            return None;
         }
         seen.push(current.clone());
         let mut terminal_qtype = false;
@@ -876,13 +935,14 @@ pub fn terminal_answer(raw: &[u8], qname_lower: &[u8], qtype: u16) -> Option<boo
             ChainNext::End => {
                 // The chain ends at a name that holds only other types
                 // (an RRSIG over the queried type or an alias excepted). ANY
-                // asks for every type.
+                // asks for every type, MAILB and MAILA for MB/MG/MR and MD/MF
+                // (RFC 1035 §3.2.3).
                 let other = |(owner, rtype, covered): &(Box<[u8]>, u16, u16)| {
                     *owner == current
                         && *rtype != qtype
                         && !(*rtype == RRSIG_TYPE && (*covered == qtype || matches!(*covered, CNAME_TYPE | DNAME_TYPE)))
                 };
-                if qtype != 255 && data.iter().any(other) {
+                if !matches!(qtype, 253..=255) && data.iter().any(other) {
                     return None;
                 }
                 return Some(soa);
@@ -945,20 +1005,23 @@ const NSEC_TYPE: u16 = 47;
 const NSEC3_TYPE: u16 = 50;
 const RRSIG_TYPE: u16 = 46;
 
-/// Scrubs a validated reply that arrived over the unauthenticated plaintext
-/// fallback, where an off-path attacker can add records (compare RFC 5452 §6,
-/// accepting only in-domain records).
+/// Scrubs a validated upstream reply down to in-domain records (RFC 5452 §6).
+/// Applies to DoH and to plain replies; only `trust_plain_upstreams` lifts it,
+/// and only for plain servers.
 ///
 /// * An Answer RR whose owner is off the question / CNAME / DNAME chain makes
 ///   the reply invalid (`None`).
 /// * Authority keeps only SOA, NS, NSEC, NSEC3 and RRSIG, and only owners at
 ///   or above a chain name; NSEC/NSEC3/RRSIG owners may also sit below a kept
 ///   SOA/NS owner (a denial proof names its neighbours, not the query).
+/// * The NS set of a NOERROR reply with no answer and a kept SOA is dropped:
+///   a forwarder does not pass a TYPE 1 NODATA on (RFC 2308 §2.2.1). A
+///   referral (NS without an SOA) is not a negative answer and keeps its NS.
 /// * Additional keeps only OPT.
 ///
 /// `Some(None)` means nothing needed removing. `Some(Some(bytes))` is the
-/// rewritten, uncompressed message. DoH replies are not scrubbed: that transport is authenticated.
-pub fn scrub_plain_reply(raw: &[u8]) -> Option<Option<Vec<u8>>> {
+/// rewritten, uncompressed message.
+pub fn scrub_reply(raw: &[u8]) -> Option<Option<Vec<u8>>> {
     let head = header(raw)?;
     let question = read_question(raw)?;
     let mut scratch = [0u8; MAX_NAME_LEN];
@@ -1009,6 +1072,13 @@ pub fn scrub_plain_reply(raw: &[u8]) -> Option<Option<Vec<u8>>> {
         }
     }
     let above = |owner: &[u8]| chain.iter().any(|name| suffix_offset(owner, name).is_some());
+    // RFC 2308 §2.1 and §2.2.1: a forwarder does not relay TYPE 1 negative
+    // answers (an SOA and NS in the authority of an NXDOMAIN, or of a NOERROR
+    // reply with no answer), so old resolvers do not take them for referrals.
+    // Keep the SOA, which carries the negative TTL, and drop the zone NS set.
+    let rcode = head.flags & 0x000f;
+    let negative = (rcode == 3 || (rcode == 0 && head.ancount == 0))
+        && records.iter().any(|(section, owner, rtype, _)| *section == 1 && *rtype == SOA_TYPE && above(owner));
     // A set, so a denial owner is checked by looking up each of its at most
     // 128 ancestors rather than against every SOA and NS owner in turn.
     let zones: HashSet<&[u8]> = records
@@ -1042,6 +1112,7 @@ pub fn scrub_plain_reply(raw: &[u8]) -> Option<Option<Vec<u8>>> {
                 true
             }
             1 => match *rtype {
+                NS_TYPE if negative => false,
                 SOA_TYPE | NS_TYPE => above(owner),
                 NSEC_TYPE | NSEC3_TYPE | RRSIG_TYPE => above(owner) || under_zone(owner),
                 _ => false,
@@ -1053,7 +1124,7 @@ pub fn scrub_plain_reply(raw: &[u8]) -> Option<Option<Vec<u8>>> {
     if keep.iter().all(|&ok| ok) {
         return Some(None);
     }
-    let expanded = expand_names(raw, false)?;
+    let expanded = expand_names(raw, &[])?;
     let ehead = header(&expanded)?;
     let mut pos = HEADER_LEN;
     for _ in 0..ehead.qdcount {
@@ -1331,6 +1402,33 @@ pub fn truncated_response_into(view: &QueryView<'_>, answer: &[u8], payload: u16
     Some(())
 }
 
+/// `reply` cut to its header, question and OPT with TC set, for a reply the
+/// path MTU refused (RFC 9715 R4): the client retries over TCP. The OPT keeps
+/// its payload size, extended RCODE, version and flags and loses its options.
+/// `None` for a reply without exactly one readable question.
+pub fn truncated_from_reply(reply: &[u8]) -> Option<Vec<u8>> {
+    let head = header(reply)?;
+    let question_end = read_question(reply)?.end.checked_add(4)?;
+    let mut out = reply.get(..question_end)?.to_vec();
+    out[2] |= (TC_BIT >> 8) as u8;
+    out[6..12].fill(0);
+    let mut scratch = [0u8; MAX_NAME_LEN];
+    let mut pos = question_end;
+    for _ in 0..u32::from(head.ancount) + u32::from(head.nscount) + u32::from(head.arcount) {
+        let record = record_header_with(reply, pos, &mut scratch, false)?;
+        if record.rtype == OPT_TYPE {
+            out.extend_from_slice(&[0, 0, OPT_TYPE as u8]);
+            out.extend_from_slice(&record.class.to_be_bytes());
+            out.extend_from_slice(&record.ttl.to_be_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out[11] = 1;
+            break;
+        }
+        pos = record.end;
+    }
+    Some(out)
+}
+
 fn build_truncated(view: &QueryView<'_>, answer_flags: u16, payload: u16, out: &mut Vec<u8>) {
     // The client's question name bytes carry its 0x20 case. A compressed
     // question has no pointer-free bytes to copy, so echo its decompressed
@@ -1483,16 +1581,26 @@ enum Field {
     Bytes(usize),
     /// A length-prefixed character string.
     Chars,
+    /// A length-prefixed character string that may not be empty.
+    Tag,
     /// Everything left in RDATA.
     Rest,
+    /// Everything left in RDATA, at least one octet.
+    Data,
     /// One or more character strings filling the RDATA.
     CharsRest,
+    /// An NSEC type bitmap filling the RDATA (RFC 4034 §4.1.2).
+    Bitmap,
+    /// SVCB parameters filling the RDATA (RFC 9460 §2.2).
+    SvcParams,
 }
 
-use Field::{Bytes, Chars, CharsRest, Name as N, Rest};
+use Field::{Bitmap, Bytes, Chars, CharsRest, Data, Name as N, Rest, SvcParams, Tag};
 
-/// RDATA layouts whose structure this forwarder validates (RFC 1035 and the
-/// legacy RFC 3597 §4 types). Types without an entry are opaque.
+/// RDATA layouts whose structure this forwarder validates (RFC 1035, the
+/// legacy RFC 3597 §4 types, DNSSEC, TLSA, SVCB, CAA and the other fixed
+/// formats below; RFC 9267 §2: RDATA must conform to its TYPE). Types without
+/// an entry are opaque.
 fn rdata_layout(rtype: u16, class: u16) -> Option<&'static [Field]> {
     Some(match rtype {
         2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 | 39 => &[N],
@@ -1510,12 +1618,45 @@ fn rdata_layout(rtype: u16, class: u16) -> Option<&'static [Field]> {
         28 if class == 1 => &[Bytes(16)],
         13 => &[Chars, Chars],
         16 => &[CharsRest],
+        43 | 48 => &[Bytes(4), Data],
+        46 => &[Bytes(18), N, Data],
+        47 => &[N, Bitmap],
+        50 => &[Bytes(4), Chars, Tag, Bitmap],
+        52 => &[Bytes(3), Data],
+        64 | 65 => &[Bytes(2), N, SvcParams],
+        257 => &[Bytes(1), Tag, Rest],
+        // X25 and GPOS (RFC 1183, RFC 1712): character strings.
+        19 => &[Chars],
+        27 => &[Chars, Chars, Chars],
+        // LOC version 0 (RFC 1876 §2), NID/L64 and L32 (RFC 6742), EUI48 and
+        // EUI64 (RFC 7043): fixed sizes.
+        29 => &[Bytes(16)],
+        104 | 106 => &[Bytes(10)],
+        105 | 108 => &[Bytes(6)],
+        109 => &[Bytes(8)],
+        // CERT (RFC 4398 §2): type, key tag, algorithm, certificate.
+        37 => &[Bytes(5), Rest],
+        // SSHFP (RFC 4255 §3.1), DHCID (RFC 4701 §3), SMIMEA (RFC 8162),
+        // CDS and CDNSKEY (RFC 7344, as DS and DNSKEY), ZONEMD (RFC 8976),
+        // URI (RFC 7553): a fixed header and a non-empty rest.
+        44 => &[Bytes(2), Data],
+        49 | 53 => &[Bytes(3), Data],
+        59 | 60 => &[Bytes(4), Data],
+        63 => &[Bytes(6), Data],
+        256 => &[Bytes(4), Data],
+        // NSEC3PARAM (RFC 5155 §4.2): fixed fields and a salt string.
+        51 => &[Bytes(4), Chars],
+        // OPENPGPKEY (RFC 7929): the key itself.
+        61 => &[Data],
+        // SPF (RFC 7208 §3.1): TXT format.
+        99 => &[CharsRest],
         _ => return None,
     })
 }
 
-/// Types whose embedded names RFC 3597 §4 forbids compressing when sent.
-const LEGACY_NAME_TYPES: [u16; 8] = [17, 18, 21, 24, 26, 30, 33, 35];
+/// Types whose embedded names must not be compressed when sent (RFC 3597 §4,
+/// RFC 4034 §3.1.7 and §4.1.1, RFC 9460 §2.2).
+const LITERAL_NAME_TYPES: [u16; 12] = [17, 18, 21, 24, 26, 30, 33, 35, 46, 47, 64, 65];
 
 /// Walks one RDATA against its layout. `None` means it does not fit exactly
 /// in `start..end`; `Some(true)` means a name used a compression pointer.
@@ -1550,8 +1691,11 @@ fn walk_rdata(
                 }
                 pos += n;
             }
-            Field::Chars => {
+            Field::Chars | Field::Tag => {
                 let n = *raw.get(pos).filter(|_| pos < end)? as usize + 1;
+                if n == 1 && matches!(*field, Field::Tag) {
+                    return None;
+                }
                 let field = raw.get(pos..pos.checked_add(n)?).filter(|_| pos + n <= end)?;
                 if let Some(out) = out.as_deref_mut() {
                     out.extend_from_slice(field);
@@ -1571,7 +1715,51 @@ fn walk_rdata(
                     pos += n;
                 }
             }
-            Field::Rest => {
+            Field::Rest | Field::Data => {
+                if pos >= end && matches!(*field, Field::Data) {
+                    return None;
+                }
+                if let Some(out) = out.as_deref_mut() {
+                    out.extend_from_slice(&raw[pos..end]);
+                }
+                pos = end;
+            }
+            Field::Bitmap => {
+                let mut previous = None;
+                let mut at = pos;
+                while at < end {
+                    let block = raw.get(at..at + 2).filter(|_| at + 2 <= end)?;
+                    let (window, len) = (block[0], block[1] as usize);
+                    if !(1..=32).contains(&len) || previous.is_some_and(|last| window <= last) {
+                        return None;
+                    }
+                    previous = Some(window);
+                    at += 2 + len;
+                }
+                if at != end {
+                    return None;
+                }
+                if let Some(out) = out.as_deref_mut() {
+                    out.extend_from_slice(&raw[pos..end]);
+                }
+                pos = end;
+            }
+            Field::SvcParams => {
+                let mut previous = None;
+                let mut at = pos;
+                while at < end {
+                    let param = raw.get(at..at + 4).filter(|_| at + 4 <= end)?;
+                    let key = u16::from_be_bytes([param[0], param[1]]);
+                    let len = u16::from_be_bytes([param[2], param[3]]) as usize;
+                    if previous.is_some_and(|last| key <= last) {
+                        return None;
+                    }
+                    previous = Some(key);
+                    at += 4 + len;
+                }
+                if at != end {
+                    return None;
+                }
                 if let Some(out) = out.as_deref_mut() {
                     out.extend_from_slice(&raw[pos..end]);
                 }
@@ -1594,20 +1782,24 @@ pub fn forbidden_record(raw: &[u8]) -> bool {
     let Some(head) = header(raw) else { return false };
     let mut scratch = [0u8; MAX_NAME_LEN];
     let mut pos = HEADER_LEN;
-    let mut class = None;
+    let mut question = None;
     for _ in 0..head.qdcount {
         let Some(end) = read_name_with(raw, pos, &mut scratch, true, true).and_then(|name| name.end.checked_add(4))
         else {
             return false;
         };
-        class = be16(raw, end.wrapping_sub(2));
+        question = be16(raw, end.wrapping_sub(4)).zip(be16(raw, end.wrapping_sub(2)));
         pos = end;
     }
-    let class = class.filter(|_| head.qdcount == 1);
+    let (qtype, class) = question.filter(|_| head.qdcount == 1).unzip();
+    // QCLASS ANY and NONE name no class of their own to compare with.
+    let class = class.filter(|class| !matches!(class, 254 | 255));
     for i in 0..head.ancount as usize + head.nscount as usize {
         let Some(record) = record_header_with(raw, pos, &mut scratch, true) else { return false };
         let foreign = i < head.ancount as usize && class.is_some_and(|c| c != record.class);
-        if record.rtype == OPT_TYPE || (128..=255).contains(&record.rtype) || foreign {
+        // An unassigned type is data only as the answer to a query for it.
+        let asked = i < head.ancount as usize && qtype == Some(record.rtype) && (129..=248).contains(&record.rtype);
+        if record.rtype == OPT_TYPE || ((128..=255).contains(&record.rtype) && !asked) || foreign {
             return true;
         }
         pos = record.end;
@@ -1619,7 +1811,8 @@ pub fn forbidden_record(raw: &[u8]) -> bool {
 /// relay. `None` means invalid wire: a name, count, RDLENGTH or known RDATA
 /// layout that does not hold (RFC 1035) or a record [`forbidden_record`]
 /// names, so the attempt must fail rather than relay it. Valid bytes pass
-/// through untouched, except that a compressed name inside a legacy-type RDATA (RFC 3597 §4) makes the message
+/// through untouched, except that a repeated record, a TSIG or a compressed name in a type listed in
+/// [`LITERAL_NAME_TYPES`] makes the message
 /// be rewritten with every name literal.
 pub fn normalize_upstream(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     let head = header(raw)?;
@@ -1637,8 +1830,17 @@ pub fn normalize_upstream(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     let mut rewrite = false;
     let mut seen_opt = false;
     let ordinary = head.ancount as usize + head.nscount as usize;
+    // Records to leave out, in order: repeats and TSIGs.
+    let mut drop = Vec::new();
+    let mut seen = HashSet::new();
     for i in 0..ordinary + head.arcount as usize {
         let record = record_header_with(raw, pos, &mut scratch, true)?;
+        // RFC 2181 §5.5: an RR is not repeated in the same or another section.
+        // A name inside RDATA is compared as sent, so a repeat that compresses
+        // it differently stays: harmless, and no RDATA is parsed for it.
+        let owner: Box<[u8]> = scratch[..record.name_len as usize].into();
+        let rdata = raw.get(record.rdata..record.end)?;
+        let repeat = record.rtype != OPT_TYPE && !seen.insert((owner, record.rtype, record.class, rdata));
         if record.rtype == OPT_TYPE {
             // RFC 6891 §6.1.1: one OPT, root-owned, in Additional, with whole
             // options and a version this forwarder speaks. Anything else is
@@ -1658,26 +1860,29 @@ pub fn normalize_upstream(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
         }
         if let Some(layout) = rdata_layout(record.rtype, record.class) {
             let pointer = walk_rdata(raw, layout, record.rdata, record.end, &mut scratch, None)?;
-            rewrite |= pointer && LEGACY_NAME_TYPES.contains(&record.rtype);
+            rewrite |= pointer && LITERAL_NAME_TYPES.contains(&record.rtype);
         }
         // RFC 8945: a TSIG covers the exchange it rode on, not a relayed or
         // cached copy, and this forwarder cannot verify it. Drop it.
-        rewrite |= i >= ordinary && record.rtype == TSIG_TYPE;
+        if repeat || (i >= ordinary && record.rtype == TSIG_TYPE) {
+            drop.push(i);
+        }
         pos = record.end;
     }
     if pos != raw.len() {
         return None;
     }
-    if !rewrite {
+    if !rewrite && drop.is_empty() {
         return Some(std::borrow::Cow::Borrowed(raw));
     }
-    expand_names(raw, true).map(std::borrow::Cow::Owned)
+    expand_names(raw, &drop).map(std::borrow::Cow::Owned)
 }
 
 /// Rewrites a validated message with no compression at all: question and
 /// owner names literal, known-layout RDATA names literal, everything else
-/// copied. Offsets shift, so no old pointer may survive.
-fn expand_names(raw: &[u8], drop_tsig: bool) -> Option<Vec<u8>> {
+/// copied, leaving out the records numbered in `drop` (ascending, counted
+/// across the sections). Offsets shift, so no old pointer may survive.
+fn expand_names(raw: &[u8], drop: &[usize]) -> Option<Vec<u8>> {
     let head = header(raw)?;
     let mut scratch = [0u8; MAX_NAME_LEN];
     let mut out = Vec::with_capacity(raw.len() + 64);
@@ -1689,12 +1894,12 @@ fn expand_names(raw: &[u8], drop_tsig: bool) -> Option<Vec<u8>> {
         out.extend_from_slice(raw.get(name.end..name.end + 4)?);
         pos = name.end + 4;
     }
-    let ordinary = head.ancount as usize + head.nscount as usize;
-    let mut dropped = 0u16;
+    let (answers, ordinary) = (head.ancount as usize, head.ancount as usize + head.nscount as usize);
+    let mut counts = [head.ancount, head.nscount, head.arcount];
     for i in 0..ordinary + head.arcount as usize {
         let record = record_header_with(raw, pos, &mut scratch, true)?;
-        if drop_tsig && i >= ordinary && record.rtype == TSIG_TYPE {
-            dropped += 1;
+        if drop.binary_search(&i).is_ok() {
+            counts[usize::from(i >= answers) + usize::from(i >= ordinary)] -= 1;
             pos = record.end;
             continue;
         }
@@ -1713,8 +1918,9 @@ fn expand_names(raw: &[u8], drop_tsig: bool) -> Option<Vec<u8>> {
         out[rdlen_at..rdlen_at + 2].copy_from_slice(&rdlen.to_be_bytes());
         pos = record.end;
     }
-    let arcount = head.arcount - dropped;
-    out[10..12].copy_from_slice(&arcount.to_be_bytes());
+    for (section, count) in counts.iter().enumerate() {
+        out[6 + 2 * section..8 + 2 * section].copy_from_slice(&count.to_be_bytes());
+    }
     (out.len() <= u16::MAX as usize).then_some(out)
 }
 
@@ -1732,7 +1938,7 @@ pub fn hickory_view(raw: &[u8]) -> Option<Message> {
     if let Some(message) = parse_exact(raw) {
         return Some(message);
     }
-    let expanded = expand_names(raw, false)?;
+    let expanded = expand_names(raw, &[])?;
     let head = header(&expanded)?;
     let mut scratch = [0u8; MAX_NAME_LEN];
     let mut pos = HEADER_LEN;
@@ -1804,7 +2010,7 @@ pub fn present_for_client(
         let (mut start, mut end, mut rdata) = (start, end, rdata);
         if !last {
             // Later records may point past the OPT; rewrite literal first.
-            let Some(expanded) = expand_names(raw, false) else { return false };
+            let Some(expanded) = expand_names(raw, &[]) else { return false };
             *raw = expanded;
             let Some(found) = find_opt(raw) else { return false };
             (start, end, _, rdata) = found;
@@ -1863,6 +2069,26 @@ pub fn present_for_client(
 /// for data this forwarder relays; every other flag (Z) is zero and no client
 /// option (ECS, Cookie, NSID, keepalive, padding, unknown codes) is carried.
 /// A query without OPT gets none. `None` for an unreadable query.
+/// The client OPT's options minus the hop-scoped ones: an unknown extension
+/// is forwarded unchanged inside our own OPT (RFC 5625 §3), while ECS, Cookie,
+/// keepalive and Padding describe only the client-to-forwarder hop.
+fn forwarded_options(raw: &[u8], mut pos: usize, end: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    while pos < end {
+        let code = be16(raw, pos)?;
+        let len = usize::from(be16(raw, pos.checked_add(2)?)?);
+        let stop = pos.checked_add(4)?.checked_add(len)?;
+        if stop > end {
+            return None;
+        }
+        if !HOP_OPTIONS.contains(&code) {
+            out.extend_from_slice(raw.get(pos..stop)?);
+        }
+        pos = stop;
+    }
+    Some(out)
+}
+
 pub fn upstream_query(raw: &[u8]) -> Option<Vec<u8>> {
     let head = header(raw)?;
     let mut scratch = [0u8; MAX_NAME_LEN];
@@ -1875,14 +2101,16 @@ pub fn upstream_query(raw: &[u8]) -> Option<Vec<u8>> {
     out[2] &= 0x79; // opcode and RD
     out[3] &= 0x30; // AD and CD
     out[6..12].fill(0);
-    if let Some((start, ..)) = find_opt(raw) {
+    if let Some((start, opt_end, _, rdata)) = find_opt(raw) {
         let payload = be16(raw, start + 3)?;
         let flags = be16(raw, start + 7)? & ((DO_BIT as u16) | CO_FLAG);
+        let options = forwarded_options(raw, rdata, opt_end)?;
         out.extend_from_slice(&[0, 0, 41]);
         out.extend_from_slice(&payload.to_be_bytes());
         out.extend_from_slice(&[0, 0]); // extended RCODE and version 0
         out.extend_from_slice(&flags.to_be_bytes());
-        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&u16::try_from(options.len()).ok()?.to_be_bytes());
+        out.extend_from_slice(&options);
         out[11] = 1;
     }
     Some(out)
@@ -2037,6 +2265,47 @@ pub fn drop_ede_to_fit(answer: &[u8], limit: u16, out: &mut Vec<u8>) -> bool {
         *flags |= 0x02;
     }
     true
+}
+
+/// Copies `answer` into `out` without its Additional records other than OPT,
+/// leaving TC clear, when the result fits `limit` (RFC 2181 §9: extra data
+/// that does not fit is omitted, with no TC). Returns false when there was
+/// nothing to remove or the answer still does not fit.
+///
+/// ponytail: drops all of Additional, not just what overflows; a client asks
+/// again for what it needs, and no RRset is ever left partial.
+pub fn drop_additional_to_fit(answer: &[u8], limit: u16, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let Some(head) = header(answer) else { return false };
+    let mut scratch = [0u8; MAX_NAME_LEN];
+    let mut pos = HEADER_LEN;
+    for _ in 0..head.qdcount {
+        let Some(name) = read_name(answer, pos, &mut scratch) else { return false };
+        pos = name.end + 4;
+    }
+    let ordinary = head.ancount as usize + head.nscount as usize;
+    let mut opt = None;
+    let mut additional = pos;
+    for i in 0..ordinary + head.arcount as usize {
+        if i == ordinary {
+            additional = pos;
+        }
+        let Some(record) = record_header(answer, pos, &mut scratch) else { return false };
+        if i >= ordinary && record.rtype == OPT_TYPE {
+            opt = Some(pos..record.end);
+        }
+        pos = record.end;
+    }
+    let kept = u16::from(opt.is_some());
+    if head.arcount == kept {
+        return false;
+    }
+    out.extend_from_slice(&answer[..additional]);
+    if let Some(opt) = opt {
+        out.extend_from_slice(&answer[opt]);
+    }
+    out[10..12].copy_from_slice(&kept.to_be_bytes());
+    out.len() <= usize::from(limit)
 }
 
 pub fn patch(raw: &mut [u8], offsets: &[u16], age: u32, stale: bool, id: u16) {
@@ -2292,6 +2561,59 @@ mod tests {
         assert!(parse_query(&non_root).is_none());
     }
 
+    /// RFC 8945 §5.2 and RFC 2931 §3: a signature must close the Additional
+    /// section. A misplaced or duplicated one is malformed, not forwarded.
+    #[test]
+    fn a_signature_out_of_place_is_malformed() {
+        // OPT before the signature is the normal order and stays valid.
+        let mut ok = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut ok, 41, 1232, 0, &[]);
+        append_record(&mut ok, 250, 255, 0, &[]);
+        assert!(parse_query(&ok).unwrap().signed);
+
+        // Anything after a TSIG, including an OPT, makes it not last.
+        let mut after_opt = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut after_opt, 250, 255, 0, &[]);
+        append_record(&mut after_opt, 41, 1232, 0, &[]);
+        assert!(parse_query(&after_opt).is_none());
+        let mut after_rr = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut after_rr, 250, 255, 0, &[]);
+        append_record(&mut after_rr, 1, 1, 0, &[192, 0, 2, 1]);
+        assert!(parse_query(&after_rr).is_none());
+
+        // One TSIG only.
+        let mut duplicate = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut duplicate, 250, 255, 0, &[]);
+        append_record(&mut duplicate, 250, 255, 0, &[]);
+        assert!(parse_query(&duplicate).is_none());
+
+        // One TSIG or one SIG(0), never both, in either order (RFC 2931 §3).
+        let mut sig0 = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut sig0, 24, 255, 0, &[0, 0]);
+        assert!(parse_query(&sig0).unwrap().signed);
+        let mut pair = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut pair, 24, 255, 0, &[0, 0]);
+        append_record(&mut pair, 250, 255, 0, &[]);
+        assert!(parse_query(&pair).is_none());
+        let mut twice = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut twice, 24, 255, 0, &[0, 0]);
+        append_record(&mut twice, 24, 255, 0, &[0, 0]);
+        assert!(parse_query(&twice).is_none());
+        let mut sig0_then_rr = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut sig0_then_rr, 24, 255, 0, &[0, 0]);
+        append_record(&mut sig0_then_rr, 1, 1, 0, &[192, 0, 2, 1]);
+        assert!(parse_query(&sig0_then_rr).is_none());
+        // A SIG covering a real type is data, not a signature.
+        let mut data_sig = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut data_sig, 24, 1, 0, &[0, 1]);
+        append_record(&mut data_sig, 1, 1, 0, &[192, 0, 2, 1]);
+        assert!(!parse_query(&data_sig).unwrap().signed);
+        let mut reversed = raw_query(&wire_name("sig.test"), 1);
+        append_record(&mut reversed, 250, 255, 0, &[]);
+        append_record(&mut reversed, 24, 255, 0, &[0, 0]);
+        assert!(parse_query(&reversed).is_none());
+    }
+
     #[test]
     fn copy_case_and_match_questions() {
         let mut client = hickory_query("MiXeD.TeSt.", RecordType::A);
@@ -2433,7 +2755,7 @@ mod tests {
         let mut looped = response("www.test.", RecordType::A, ResponseCode::NoError);
         looped.add_answer(Record::from_rdata(name.clone(), 60, RData::CNAME(CNAME(alias.clone()))));
         looped.add_answer(Record::from_rdata(alias.clone(), 60, RData::CNAME(CNAME(name.clone()))));
-        assert_eq!(terminal_answer(&raw(&looped), &qname, 1), Some(false));
+        assert_eq!(terminal_answer(&raw(&looped), &qname, 1), None);
 
         let mut referral = response("www.test.", RecordType::A, ResponseCode::NoError);
         referral.add_authority(Record::from_rdata(
@@ -2893,6 +3215,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rfc9267_s516_dnssec_svcb_caa_tlsa_rdata_must_fit_its_type() {
+        let rrsig = b"\x00\x01\x08\x02\x00\x00\x0e\x10\x00\x00\x00\x02\x00\x00\x00\x01\x12\x34\x01b\x00sig";
+        let good: [(u16, &[u8]); 12] = [
+            (43, b"\x12\x34\x08\x02digest"),
+            (46, rrsig),
+            (47, b"\x01b\x00\x00\x01\x40"),
+            (47, b"\x01b\x00\x00\x01\x40\x01\x01\x80"),
+            (48, b"\x01\x01\x03\x08key"),
+            (50, b"\x01\x00\x00\x0a\x02ab\x03abc\x00\x01\x40"),
+            (50, b"\x01\x00\x00\x0a\x00\x03abc"),
+            (52, b"\x03\x01\x01hash"),
+            (64, b"\x00\x00\x00"),
+            (65, b"\x00\x01\x01b\x00\x00\x01\x00\x03\x02h2\x00\x03\x00\x02\x01\xbb"),
+            (257, b"\x00\x05issueca.test"),
+            (257, b"\x80\x03tag"),
+        ];
+        for (rtype, rdata) in good {
+            let raw = response_with(rtype, 1, rdata);
+            assert_eq!(normalize_upstream(&raw).as_deref(), Some(raw.as_slice()), "type {rtype}");
+        }
+        for rtype in [43u16, 46, 47, 48, 50, 52, 64, 65, 257] {
+            assert!(normalize_upstream(&response_with(rtype, 1, b"\x01")).is_none(), "1 byte, type {rtype}");
+        }
+        let bad: [(&str, u16, &[u8]); 12] = [
+            ("DS with no digest", 43, b"\x12\x34\x08\x02"),
+            ("RRSIG with no signature", 46, &rrsig[..rrsig.len() - 3]),
+            ("DNSKEY with no key", 48, b"\x01\x01\x03\x08"),
+            ("TLSA with no data", 52, b"\x03\x01\x01"),
+            ("NSEC bitmap window with length 0", 47, b"\x01b\x00\x00\x00"),
+            ("NSEC bitmap window over 32 bytes", 47, b"\x01b\x00\x00\x21aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ("NSEC bitmap cut short", 47, b"\x01b\x00\x00\x02\x40"),
+            ("NSEC bitmap windows out of order", 47, b"\x01b\x00\x01\x01\x40\x00\x01\x40"),
+            ("NSEC3 with an empty hash", 50, b"\x01\x00\x00\x0a\x00\x00\x00\x01\x40"),
+            ("SVCB params out of order", 64, b"\x00\x01\x00\x00\x03\x00\x00\x00\x01\x00\x00"),
+            ("SVCB param past the end", 65, b"\x00\x01\x00\x00\x01\x00\x05h2"),
+            ("CAA with an empty tag", 257, b"\x00\x00value"),
+        ];
+        for (what, rtype, rdata) in bad {
+            assert!(normalize_upstream(&response_with(rtype, 1, rdata)).is_none(), "{what}");
+        }
+    }
+
+    #[test]
+    fn rfc4034_rfc9460_names_in_signature_denial_and_svcb_rdata_are_sent_literal() {
+        // RFC 4034 and RFC 9460 forbid compressing these names, so a pointer
+        // from upstream is expanded, like the RFC 3597 legacy types.
+        let mut rrsig = b"\x00\x01\x08\x02\x00\x00\x0e\x10\x00\x00\x00\x02\x00\x00\x00\x01\x12\x34".to_vec();
+        rrsig.extend_from_slice(b"\xc0\x0csig");
+        for (rtype, rdata) in [
+            (46u16, rrsig.as_slice()),
+            (47, b"\xc0\x0c\x00\x01\x40"),
+            (64, b"\x00\x01\xc0\x0c"),
+            (65, b"\x00\x01\xc0\x0c"),
+        ] {
+            let raw = response_with(rtype, 1, rdata);
+            let out = normalize_upstream(&raw).unwrap();
+            assert!(matches!(out, std::borrow::Cow::Owned(_)), "type {rtype} is rewritten");
+            assert!(out.len() > raw.len(), "type {rtype} grew by the expanded name");
+        }
+    }
+
+    #[test]
+    fn a_response_is_never_a_zone_transfer_request() {
+        for qtype in [251u16, 252] {
+            let mut raw = raw_query(&wire_name("zone.test"), qtype);
+            assert!(is_zone_transfer(&parse_query(&raw).unwrap()), "type {qtype} query");
+            raw[2] |= 0x80;
+            assert!(!is_zone_transfer(&parse_query(&raw).unwrap()), "type {qtype} with QR set");
+        }
+    }
+
+    #[test]
+    fn a_truncated_copy_of_a_reply_keeps_header_question_and_opt() {
+        // "a." A with two answers, then an OPT (payload 1232, DO, one option).
+        let mut reply = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 1];
+        for last in [1u8, 2] {
+            reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, last]);
+        }
+        reply.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 6, 0xff, 0, 0, 2, 1, 2]);
+        let cut = truncated_from_reply(&reply).unwrap();
+        let mut expected = vec![0x12, 0x34, 0x83, 0x80, 0, 1, 0, 0, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 1];
+        expected.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0x80, 0, 0, 0]);
+        assert_eq!(cut, expected);
+        let mut plain = reply[..19 + 32].to_vec();
+        plain[11] = 0;
+        assert_eq!(
+            &truncated_from_reply(&plain).unwrap()[..],
+            &[&expected[..11], &[0], &expected[12..19]].concat()[..]
+        );
+        assert!(truncated_from_reply(&reply[..12]).is_none(), "no question");
+    }
+
+    #[test]
+    fn rfc9267_s344_a_pointer_to_a_root_terminator_is_invalid() {
+        // The question "a." ends with its root octet at offset 14.
+        let mut owner = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        owner.extend_from_slice(&[0xc0, 14, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        assert!(normalize_upstream(&owner).is_none(), "owner name");
+        assert!(normalize_upstream(&response_with(2, 1, b"\xc0\x0e")).is_none(), "RDATA name");
+        assert!(normalize_upstream(&response_with(2, 1, b"\xc0\x0c")).is_some(), "a pointer to a label");
+        // A first pointer that lands on another pointer is refused in a
+        // response; the question's own pointer chain in a query stays lenient.
+        let mut via = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        via.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        let mut double = via.clone();
+        double.extend_from_slice(&[0xc0, 19, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 2]);
+        via.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 2]);
+        assert!(normalize_upstream(&via).is_some(), "two owners pointing at the question name");
+        assert!(normalize_upstream(&double).is_none(), "an owner pointing at a pointer");
+        // A query's OPT owner that points at the question's root octet is
+        // malformed too: FORMERR, and its EDNS is not trusted.
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1, 1, b'a', 0, 0, 1, 0, 1];
+        query.extend_from_slice(&[0xc0, 14, 0, 41, 0x04, 0xd0, 0, 0, 0, 0, 0, 0]);
+        assert!(parse_query(&query).is_none(), "query OPT owner");
+        query[19..21].copy_from_slice(&[0, 0]);
+        query.remove(19);
+        assert!(parse_query(&query).is_some_and(|view| view.edns_present), "literal root owner");
+    }
+
+    #[test]
+    fn rfc5625_s215_a_meta_type_is_usable_only_as_the_answer_to_that_query() {
+        // TYPE 200 answering a TYPE 200 question, then a question for A.
+        let answer = |qtype: u16, rtype: u16| {
+            let mut raw = shaped(&[(rtype, 1, b"x")], &[]);
+            raw[15..17].copy_from_slice(&qtype.to_be_bytes());
+            raw
+        };
+        assert!(normalize_upstream(&answer(200, 200)).is_some());
+        assert!(normalize_upstream(&answer(1, 200)).is_none(), "not what was asked");
+        assert!(normalize_upstream(&answer(200, 201)).is_none());
+        // Never usable as data, even when asked for.
+        for rtype in [41u16, 128, 249, 250, 251, 252] {
+            assert!(normalize_upstream(&answer(rtype, rtype)).is_none(), "type {rtype}");
+        }
+    }
+
+    #[test]
+    fn rfc2181_s436_a_repeated_record_is_relayed_once() {
+        let a = (1u16, 1u16, &b"\xc0\x00\x02\x01"[..]);
+        let b = (1u16, 1u16, &b"\xc0\x00\x02\x02"[..]);
+        let counts = |raw: &[u8]| {
+            let head = header(raw).unwrap();
+            (head.ancount, head.nscount)
+        };
+        let raw = shaped(&[a, b, a], &[]);
+        assert_eq!(counts(&normalize_upstream(&raw).unwrap()), (2, 0), "the repeat in Answer goes");
+        let raw = shaped(&[a], &[a, b]);
+        let other_section = normalize_upstream(&raw).unwrap();
+        assert_eq!(counts(&other_section), (1, 1), "the repeat in Authority goes");
+        assert!(hickory_view(&other_section).is_some(), "the rewrite stays valid");
+        let distinct = shaped(&[a, b], &[]);
+        assert_eq!(normalize_upstream(&distinct).as_deref(), Some(distinct.as_slice()), "nothing to remove");
+    }
+
     /// A response to "a." (type A, class IN) whose Answer holds `records`
     /// (owner pointer, type, class, RDATA), then `authority` the same way.
     fn shaped(records: &[(u16, u16, &[u8])], authority: &[(u16, u16, &[u8])]) -> Vec<u8> {
@@ -2927,18 +3404,18 @@ mod tests {
             assert!(normalize_upstream(&shaped(&[a], &[bad])).is_some(), "class {class} in Authority");
         }
         // Types just outside the range and a CH question answered in CH stay valid.
-        for rtype in [127u16, 256, 65280] {
-            assert!(normalize_upstream(&shaped(&[a, (rtype, 1, b"x")], &[])).is_some(), "type {rtype}");
+        // 256 is URI, whose RDATA has a format: priority, weight, target.
+        for (rtype, rdata) in [(127u16, &b"x"[..]), (256, b"\x00\x01\x00\x01u"), (65280, b"x")] {
+            assert!(normalize_upstream(&shaped(&[a, (rtype, 1, rdata)], &[])).is_some(), "type {rtype}");
         }
         let mut chaos = shaped(&[(16, 3, b"\x01x")], &[]);
         chaos[17..19].copy_from_slice(&3u16.to_be_bytes());
         assert!(normalize_upstream(&chaos).is_some(), "a CH answer to a CH question");
-        // QCLASS ANY is never forwarded, so no answer to it is usable, not
-        // even IN data.
-        for class in [1u16, 3] {
+        // QCLASS ANY and NONE have no class of their own to compare with.
+        for (qclass, class) in [(255u16, 1u16), (255, 3), (254, 1)] {
             let mut any = shaped(&[(1, class, b"\xc0\x00\x02\x03")], &[]);
-            any[17..19].copy_from_slice(&255u16.to_be_bytes());
-            assert!(normalize_upstream(&any).is_none(), "class {class} answer to QCLASS ANY");
+            any[17..19].copy_from_slice(&qclass.to_be_bytes());
+            assert!(normalize_upstream(&any).is_some(), "class {class} answer to QCLASS {qclass}");
         }
         // Additional is not checked: a TSIG there is dropped, not invalid.
         let mut signed = shaped(&[a], &[]);
@@ -3026,6 +3503,26 @@ mod tests {
         let mut nodata = response("www.test.", RecordType::A, ResponseCode::NoError);
         nodata.add_authority(soa("test."));
         assert_eq!(terminal_answer(&raw(&nodata), &qname, 1), Some(true));
+    }
+
+    #[test]
+    fn mailb_and_maila_answers_are_not_contradictions() {
+        // RFC 1035 s3.2.3: MAILB returns MB/MG/MR, MAILA returns MD/MF, so a
+        // record of another type at the name is the answer, not a mismatch.
+        let qname = wire_name("www.test");
+        let mailbox = |owner: &str, code: u16| {
+            Record::from_rdata(
+                Name::from_ascii(owner).unwrap(),
+                60,
+                RData::Unknown { code: RecordType::from(code), rdata: NULL::with(wire_name("box.test.")) },
+            )
+        };
+        // MB (7) answers MAILB, MD (3) answers MAILA.
+        for (record_type, code, held) in [(253u16, 253u16, 7u16), (254, 254, 3)] {
+            let mut message = response("www.test.", RecordType::Unknown(record_type), ResponseCode::NoError);
+            message.add_answer(mailbox("www.test.", held));
+            assert_eq!(terminal_answer(&message.to_vec().unwrap(), &qname, code), Some(false), "{code}");
+        }
     }
 
     #[test]
@@ -3196,7 +3693,8 @@ mod tests {
         let view = parse_query(&out).unwrap();
         assert!(view.edns_present && view.edns_do && !view.has_non_opt_additional);
         assert_eq!((view.edns_flags, view.edns_payload), (0xc000, 1400), "DO and CO kept, Z cleared");
-        assert!(!view.edns_options);
+        assert!(view.edns_options, "the NSID option is forwarded");
+        assert_eq!(&out[out.len() - 4..], &[0, 3, 0, 0], "the option is forwarded unchanged");
         assert_eq!(header(&out).unwrap().arcount, 1);
         let plain = raw_query(&wire_name("a.test"), 1);
         assert_eq!(upstream_query(&plain).unwrap(), plain, "no OPT is added");
@@ -3368,7 +3866,7 @@ mod tests {
             m.add_authority(ns("test."));
             m.edns = Some(Edns::new());
         });
-        assert_eq!(scrub_plain_reply(&raw), Some(None));
+        assert_eq!(scrub_reply(&raw), Some(None));
     }
 
     #[test]
@@ -3382,7 +3880,7 @@ mod tests {
             m.add_additional(rec("victim.test.", RData::A(A::new(203, 0, 113, 9))));
             m.edns = Some(Edns::new());
         });
-        let scrubbed = scrub_plain_reply(&raw).unwrap().expect("something was removed");
+        let scrubbed = scrub_reply(&raw).unwrap().expect("something was removed");
         let message = Message::from_vec(&scrubbed).unwrap();
         assert_eq!(message.answers.len(), 1);
         let owners: Vec<_> =
@@ -3394,6 +3892,78 @@ mod tests {
     }
 
     #[test]
+    fn plain_scrub_suppresses_the_ns_of_a_nodata_authority() {
+        // RFC 2308 §2.2.1: a forwarder does not pass on TYPE 1 NODATA. The
+        // SOA (the negative TTL) stays, the zone NS set does not.
+        let raw = scrub_message(|m| {
+            m.add_authority(ns("test."));
+            m.add_authority(scrub_soa("test."));
+        });
+        let scrubbed = scrub_reply(&raw).unwrap().expect("the NS was removed");
+        let message = Message::from_vec(&scrubbed).unwrap();
+        assert!(message.answers.is_empty());
+        let authority: Vec<_> =
+            message.authorities.iter().map(|r| (r.name.to_ascii(), u16::from(r.record_type()))).collect();
+        assert_eq!(authority, [("test.".to_string(), 6)], "only the SOA remains");
+        assert_eq!(normalize_upstream(&scrubbed).as_deref(), Some(scrubbed.as_slice()), "the rewrite is valid wire");
+    }
+
+    /// RFC 2308 §2.1: a TYPE 1 NXDOMAIN (SOA and NS) reaches the client as
+    /// TYPE 2, also at the end of a CNAME chain.
+    #[test]
+    fn plain_scrub_turns_a_type1_nxdomain_into_type2() {
+        for alias in [false, true] {
+            let raw = scrub_message(|m| {
+                m.metadata.response_code = ResponseCode::NXDomain;
+                if alias {
+                    m.add_answer(rec("a.test.", RData::CNAME(CNAME(Name::from_ascii("gone.test.").unwrap()))));
+                }
+                m.add_authority(ns("test."));
+                m.add_authority(scrub_soa("test."));
+            });
+            let scrubbed = scrub_reply(&raw).unwrap().expect("the NS was removed");
+            let message = Message::from_vec(&scrubbed).unwrap();
+            assert_eq!(message.answers.len(), usize::from(alias), "the alias stays");
+            let types: Vec<u16> = message.authorities.iter().map(|r| u16::from(r.record_type())).collect();
+            assert_eq!(types, [6], "only the SOA remains");
+            assert_eq!(
+                normalize_upstream(&scrubbed).as_deref(),
+                Some(scrubbed.as_slice()),
+                "the rewrite is valid wire"
+            );
+        }
+    }
+
+    /// The same shape taken from the harness wire: an uncompressed question,
+    /// a SOA and an NS in Authority, no Answer. The NS set must be removed.
+    #[test]
+    fn a_type1_nodata_from_the_wire_loses_its_ns() {
+        let raw = hex_bytes(
+            "393081800001000000020000096e6f64617461333933077a6f6e6533393304746573740000010001077a6f6e65333933047465737400000600010000003c002d026e73047465737400066e6f626f647907696e76616c6964000000000100000e1000000258000151800000003c077a6f6e65333933047465737400000200010000012c0012036e7331077a6f6e65333933047465737400",
+        );
+        let scrubbed = scrub_reply(&raw).unwrap().expect("the NS set is removed");
+        let message = Message::from_vec(&scrubbed).unwrap();
+        let types: Vec<u16> = message.authorities.iter().map(|r| u16::from(r.record_type())).collect();
+        assert_eq!(types, [6], "only the SOA remains");
+    }
+
+    #[test]
+    fn plain_scrub_keeps_the_ns_of_a_referral_and_answer() {
+        // NS without an SOA is a referral, not a negative answer (RFC 2308
+        // §2.2), and a positive answer is not TYPE 1 NODATA.
+        let referral = scrub_message(|m| {
+            m.add_authority(ns("test."));
+        });
+        assert_eq!(scrub_reply(&referral), Some(None));
+        let answer = scrub_message(|m| {
+            m.add_answer(rec("a.test.", RData::A(A::new(192, 0, 2, 1))));
+            m.add_authority(ns("test."));
+            m.add_authority(scrub_soa("test."));
+        });
+        assert_eq!(scrub_reply(&answer), Some(None));
+    }
+
+    #[test]
     fn plain_scrub_follows_cname_chains_and_rejects_off_chain_answers() {
         let cname = |owner: &str, target: &str| rec(owner, RData::CNAME(CNAME(Name::from_ascii(target).unwrap())));
         let chained = scrub_message(|m| {
@@ -3401,16 +3971,16 @@ mod tests {
             m.add_answer(cname("b.test.", "c.example."));
             m.add_answer(rec("c.example.", RData::A(A::new(192, 0, 2, 1))));
         });
-        assert_eq!(scrub_plain_reply(&chained), Some(None), "every owner is on the chain");
+        assert_eq!(scrub_reply(&chained), Some(None), "every owner is on the chain");
         let injected = scrub_message(|m| {
             m.add_answer(rec("a.test.", RData::A(A::new(192, 0, 2, 1))));
             m.add_answer(rec("victim.test.", RData::A(A::new(203, 0, 113, 9))));
         });
-        assert_eq!(scrub_plain_reply(&injected), None, "an off-chain Answer owner invalidates the reply");
+        assert_eq!(scrub_reply(&injected), None, "an off-chain Answer owner invalidates the reply");
         let apex = scrub_message(|m| {
             m.add_answer(rec("test.", RData::A(A::new(203, 0, 113, 9))));
         });
-        assert_eq!(scrub_plain_reply(&apex), None, "an ancestor is not on the chain either");
+        assert_eq!(scrub_reply(&apex), None, "an ancestor is not on the chain either");
     }
 
     #[test]
@@ -3431,9 +4001,9 @@ mod tests {
             })
         };
         let within = chain(MAX_CHAIN_RECORDS);
-        assert_eq!(scrub_plain_reply(&within), Some(None));
+        assert_eq!(scrub_reply(&within), Some(None));
         let beyond = chain(MAX_CHAIN_RECORDS + 10);
-        assert_eq!(scrub_plain_reply(&beyond), None);
+        assert_eq!(scrub_reply(&beyond), None);
     }
 
     // ---- boundary and operator tests (cargo-mutants survivors) ----
@@ -3536,20 +4106,29 @@ mod tests {
 
     #[test]
     fn a_name_may_follow_128_pointers_and_no_more() {
-        // A root label at 12, then pointers at 14, 16, ... each to the one
-        // before; later targets exceed 255, so the 14-bit offset matters.
+        // The name "a." at 12, then pointers at 15, 17, ... each to the one
+        // before (later targets exceed 255, so the 14-bit offset matters),
+        // then the label "x" followed by a pointer to the last of them. The
+        // name read starts with a pointer to that label: its first pointer
+        // lands on a label (RFC 9267 §2), and the rest of the chain follows.
         let chain = |jumps: usize| {
-            let mut raw = vec![0u8; 14];
-            for i in 1..=jumps {
-                let target = 12 + 2 * (i - 1);
-                raw.extend_from_slice(&[0xc0 | (target >> 8) as u8, target as u8]);
+            let mut raw = vec![0u8; 12];
+            raw.extend_from_slice(&[1, b'a', 0]);
+            let mut last = 12;
+            for _ in 1..jumps - 1 {
+                let here = raw.len();
+                raw.extend_from_slice(&[0xc0 | (last >> 8) as u8, last as u8]);
+                last = here;
             }
+            let label = raw.len();
+            raw.extend_from_slice(&[1, b'x', 0xc0 | (last >> 8) as u8, last as u8]);
+            raw.extend_from_slice(&[0xc0 | (label >> 8) as u8, label as u8]);
             raw
         };
         let mut out = [0u8; MAX_NAME_LEN];
         let ok = chain(128);
         let info = read_name(&ok, ok.len() - 2, &mut out).unwrap();
-        assert_eq!((info.len, info.compressed), (1, true));
+        assert_eq!((info.len, info.compressed), (5, true), "x.a.");
         let too_long = chain(129);
         assert!(read_name(&too_long, too_long.len() - 2, &mut out).is_none());
     }
@@ -3736,24 +4315,27 @@ mod tests {
     fn plain_scrub_applies_a_dname_below_its_owner_only() {
         // A DNAME puts its target on the chain for a name below the owner...
         let below = reply(0, &[rr("test", 39, &wire_name("t.example"))], &[soa_rr("example")]);
-        assert_eq!(scrub_plain_reply(&below), Some(None), "the target's SOA is kept");
+        assert_eq!(scrub_reply(&below), Some(None), "the target's SOA is kept");
         // ...but not for the owner itself (RFC 6672 §2.4).
         let own = reply(0, &[rr("a.test", 39, &wire_name("t.example"))], &[soa_rr("example")]);
-        assert!(scrub_plain_reply(&own).unwrap().is_some(), "the target's SOA is dropped");
+        assert!(scrub_reply(&own).unwrap().is_some(), "the target's SOA is dropped");
     }
+
+    /// Next name root, type bitmap holding A.
+    const NSEC_RDATA: [u8; 4] = [0, 0, 1, 0x40];
 
     #[test]
     fn plain_scrub_trusts_denial_proofs_only_under_a_kept_zone() {
         // An NSEC below the question name, with no SOA or NS above it, proves
         // nothing the reply may carry.
-        let stray = reply(0, &[rr("a.test", 1, &A_RDATA)], &[rr("x.a.test", 47, &[0, 1, 2])]);
-        let scrubbed = scrub_plain_reply(&stray).unwrap().expect("dropped");
+        let stray = reply(0, &[rr("a.test", 1, &A_RDATA)], &[rr("x.a.test", 47, &NSEC_RDATA)]);
+        let scrubbed = scrub_reply(&stray).unwrap().expect("dropped");
         assert_eq!(&scrubbed[8..10], &[0, 0], "no authority record is left");
-        let stray = reply(3, &[], &[rr("x.a.test", 47, &[0, 1, 2])]);
-        assert_eq!(&scrub_plain_reply(&stray).unwrap().unwrap()[8..10], &[0, 0]);
+        let stray = reply(3, &[], &[rr("x.a.test", 47, &NSEC_RDATA)]);
+        assert_eq!(&scrub_reply(&stray).unwrap().unwrap()[8..10], &[0, 0]);
         // Under a kept SOA zone it stays.
-        let proof = reply(3, &[], &[soa_rr("test"), rr("x.a.test", 47, &[0, 1, 2])]);
-        assert_eq!(scrub_plain_reply(&proof), Some(None));
+        let proof = reply(3, &[], &[soa_rr("test"), rr("x.a.test", 47, &NSEC_RDATA)]);
+        assert_eq!(scrub_reply(&proof), Some(None));
     }
 
     #[test]
@@ -3781,7 +4363,7 @@ mod tests {
         let started = std::time::Instant::now();
         // The NSEC records are dropped; the rewrite, with names expanded,
         // would not fit a message, so the reply is refused.
-        assert_eq!(scrub_plain_reply(&m), None);
+        assert_eq!(scrub_reply(&m), None);
         let limit = if cfg!(debug_assertions) { 1000 } else { 50 };
         assert!(started.elapsed().as_millis() < limit, "{:?}", started.elapsed());
     }
@@ -3794,7 +4376,7 @@ mod tests {
         let reply_with = |targets: usize| {
             let mut answers = vec![cname_rr("t0.test", "u.test"), rr("u.test", 1, &A_RDATA)];
             answers.extend((0..targets).map(|i| cname_rr("a.test", &format!("t{i}.test"))));
-            scrub_plain_reply(&reply(0, &answers, &[]))
+            scrub_reply(&reply(0, &answers, &[]))
         };
         assert_eq!(reply_with(62), Some(None), "63 names");
         assert_eq!(reply_with(63), Some(None), "64 names still grow");
@@ -3873,7 +4455,7 @@ mod tests {
     fn a_plain_additional_record_does_not_force_a_rewrite() {
         let mut raw = reply(0, &[rr("a.test", 1, &A_RDATA)], &[]);
         raw[11] = 1;
-        raw.extend_from_slice(&rr("a.test", 1, &A_RDATA));
+        raw.extend_from_slice(&rr("b.test", 1, &A_RDATA));
         assert!(matches!(normalize_upstream(&raw).unwrap(), std::borrow::Cow::Borrowed(_)));
         // A TSIG in Additional does: it is dropped from the relay.
         raw[11] = 2;
@@ -3939,6 +4521,57 @@ mod tests {
         assert_eq!(positive.soa, None);
         let answer_soa = ttl_fields(&reply(0, &[soa_rr("a.test")], &[])).unwrap();
         assert_eq!(answer_soa.soa, None, "an SOA in Answer is not the negative SOA");
+    }
+
+    #[test]
+    fn rfc9267_s516_fixed_format_types_must_fit_their_layout() {
+        let good: [(u16, &[u8]); 20] = [
+            (19, b"\x0a1234567890"),
+            (27, b"\x02-1\x022a\x010"),
+            (29, &[0; 16]),
+            (37, b"\x00\x01\x12\x34\x05cert"),
+            (44, b"\x01\x02fingerprint"),
+            (49, b"\x00\x01\x01digest"),
+            (51, b"\x01\x00\x00\x0a\x02ab"),
+            (53, b"\x03\x01\x01hash"),
+            (59, b"\x00\x00\x00\x00\x00"),
+            (60, b"\x00\x00\x03\x00\x00"),
+            (61, b"key"),
+            (63, b"\x00\x00\x00\x01\x01\x01digestdigest"),
+            (99, b"\x06v=spf1"),
+            (104, &[0; 10]),
+            (105, &[0; 6]),
+            (106, &[0; 10]),
+            (108, &[0; 6]),
+            (109, &[0; 8]),
+            (256, b"\x00\x0a\x00\x01https://x.test/"),
+            (256, b"\x00\x0a\x00\x01u"),
+        ];
+        for (rtype, rdata) in good {
+            let raw = response_with(rtype, 1, rdata);
+            assert_eq!(normalize_upstream(&raw).as_deref(), Some(raw.as_slice()), "valid type {rtype}");
+        }
+        let bad: [(u16, &[u8]); 16] = [
+            (19, b"\x0512"),
+            (27, b"\x02-1\x022a"),
+            (29, &[0; 15]),
+            (37, b"\x00\x01\x12\x34"),
+            (44, b"\x01\x02"),
+            (49, b"\x00\x01\x01"),
+            (51, b"\x01\x00\x00\x0a\x05ab"),
+            (59, b"\x00\x00\x00\x00"),
+            (61, b""),
+            (63, b"\x00\x00\x00\x01\x01\x01"),
+            (99, b""),
+            (104, &[0; 9]),
+            (105, &[0; 7]),
+            (108, &[0; 5]),
+            (109, &[0; 9]),
+            (256, b"\x00\x0a\x00\x01"),
+        ];
+        for (rtype, rdata) in bad {
+            assert!(normalize_upstream(&response_with(rtype, 1, rdata)).is_none(), "malformed type {rtype}");
+        }
     }
 
     #[test]
@@ -4022,5 +4655,415 @@ mod tests {
         let view = hickory_view(&kept).unwrap();
         assert_eq!(u16::from(view.queries[0].query_type()), VIEW_PLACEHOLDER_TYPE);
         assert_eq!(u16::from(view.answers[0].record_type()), VIEW_PLACEHOLDER_TYPE);
+    }
+}
+
+#[cfg(test)]
+mod rfc_tests {
+    use super::*;
+    use hickory_proto::op::Message;
+
+    fn wire_name(name: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in name.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    fn query(rd: bool, name: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0x12, 0x34, u8::from(rd), 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        raw.extend_from_slice(name);
+        raw.extend_from_slice(&[0, 1, 0, 1]);
+        raw
+    }
+
+    fn query_with_opt(rdata: &[u8]) -> Vec<u8> {
+        let mut raw = query(true, &wire_name("a.test"));
+        raw[11] = 1;
+        raw.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0]);
+        raw.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        raw.extend_from_slice(rdata);
+        raw
+    }
+
+    fn option(code: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = code.to_be_bytes().to_vec();
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// Response to "a." type A with one A record in each of answer, authority
+    /// and additional (owner pointer to the question).
+    fn full_response() -> Vec<u8> {
+        let mut raw = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 1, 0, 1];
+        raw.extend_from_slice(&[1, b'a', 0, 0, 1, 0, 1]);
+        for _ in 0..3 {
+            raw.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        }
+        raw
+    }
+
+    #[test]
+    fn rfc1034_s1266_rd_clear_query_is_never_upgraded_upstream() {
+        let name = wire_name("a.test");
+        let rd0 = upstream_query(&query(false, &name)).unwrap();
+        assert_eq!(rd0[2] & 1, 0, "RD=0 stays RD=0 upstream");
+        let rd1 = upstream_query(&query(true, &name)).unwrap();
+        assert_eq!(rd1[2] & 1, 1, "RD=1 is kept");
+    }
+
+    #[test]
+    fn rfc1035_s1677_only_the_11_label_prefix_is_a_pointer() {
+        let mut out = [0u8; MAX_NAME_LEN];
+        // Header, then "a." at 12..15, then a name at 15 starting with `first`.
+        let msg = |first: u8, rest: &[u8]| {
+            let mut raw = vec![0u8; 12];
+            raw.extend_from_slice(&[1, b'a', 0, first]);
+            raw.extend_from_slice(rest);
+            raw
+        };
+        // 11 prefix: a pointer to the prior name.
+        let info = read_name_with(&msg(0xc0, &[12]), 15, &mut out, true, true).expect("11 is a pointer");
+        assert!(info.compressed);
+        assert_eq!(&out[..info.len as usize], &[1, b'a', 0]);
+        // Reserved 10 and 01 prefixes are not labels or pointers, even when
+        // the next byte would be a valid target.
+        assert!(read_name_with(&msg(0x80, &[12]), 15, &mut out, true, true).is_none(), "10");
+        assert!(read_name_with(&msg(0x40, &[12]), 15, &mut out, true, true).is_none(), "01");
+        // A pointer is two octets.
+        assert!(read_name_with(&msg(0xc0, &[]), 15, &mut out, true, true).is_none(), "cut pointer");
+    }
+
+    #[test]
+    fn rfc1035_s1679_offset_counts_from_the_start_of_the_message() {
+        let mut out = [0u8; MAX_NAME_LEN];
+        // Response: question "a." at 12, answer owner is a pointer to offset 12.
+        let raw = full_response();
+        let info = read_name_with(&raw, 19, &mut out, true, true).unwrap();
+        assert_eq!(&out[..info.len as usize], &[1, b'a', 0]);
+        assert_eq!(info.end, 21);
+        // Offset 13 would land inside the label, on the byte 'a' (97), which
+        // is not a label length.
+        let mut off = raw.clone();
+        off[20] = 13;
+        assert!(read_name_with(&off, 19, &mut out, true, true).is_none());
+        // The reserved 10 pattern is rejected.
+        let mut reserved = raw.clone();
+        reserved[19] = 0x80;
+        assert!(read_name_with(&reserved, 19, &mut out, true, true).is_none());
+    }
+
+    #[test]
+    fn rfc1035_s1682_zero_offset_is_the_first_byte_of_the_id_field() {
+        // ID bytes 01 61, flags byte 00: bytes 0..3 read as label "a" then root.
+        let mut raw = vec![0x01, 0x61, 0x00, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        raw.extend_from_slice(&[0xc0, 0x00, 0, 1, 0, 1]);
+        let mut out = [0u8; MAX_NAME_LEN];
+        let info = read_name_with(&raw, 12, &mut out, true, false).expect("offset 0 resolves");
+        assert_eq!(&out[..info.len as usize], &[1, b'a', 0]);
+        // A response reader refuses a pointer into the header.
+        assert!(read_name_with(&raw, 12, &mut out, true, true).is_none());
+    }
+
+    #[test]
+    fn rfc4343_s254_pointer_into_the_question_survives_a_case_difference() {
+        let raw = query(true, &wire_name("MiXeD.Test"));
+        let view = parse_query(&raw).unwrap();
+        let mut out = Vec::new();
+        blocked_response_into(&view, &mut out);
+        let qlen = view.qname_wire.len();
+        assert_eq!(&out[12..12 + qlen], &wire_name("MiXeD.Test")[..], "question keeps the client's case");
+        assert_eq!(&out[16 + qlen..18 + qlen], &[0xc0, 0x0c], "owner points into the question");
+        let msg = Message::from_vec(&out).unwrap();
+        let owner = msg.authorities[0].name.to_ascii();
+        assert!(owner.eq_ignore_ascii_case("mixed.test."), "owner decodes to the question name: {owner}");
+    }
+
+    /// SCOPE PREFIX-LENGTH of every ECS option in the OPT of `raw`.
+    fn ecs_scopes(raw: &[u8]) -> Vec<u8> {
+        let (start, end, ..) = find_opt(raw).expect("OPT present");
+        let mut scopes = Vec::new();
+        let mut pos = start + 11; // root, type, class, ttl, rdlength
+        while pos + 4 <= end {
+            let len = usize::from(be16(raw, pos + 2).unwrap());
+            if be16(raw, pos) == Some(8) {
+                scopes.push(raw[pos + 4 + 3]);
+            }
+            pos += 4 + len;
+        }
+        scopes
+    }
+
+    #[test]
+    fn rfc7871_s465_ecs_scope_prefix_must_be_zero_in_queries() {
+        // The MUST binds what this forwarder sends: a client ECS carrying a
+        // nonzero SCOPE reaches upstream with no ECS option, or with scope 0.
+        for scope in [1u8, 8, 255] {
+            let sent = query_with_opt(&option(8, &[0, 1, 8, scope, 192]));
+            // Control: the walker sees the client's own nonzero scope.
+            assert_eq!(ecs_scopes(&sent), [scope]);
+            let out = upstream_query(&sent).unwrap();
+            assert!(ecs_scopes(&out).iter().all(|&s| s == 0), "client scope {scope} forwarded: {out:02x?}");
+        }
+    }
+
+    #[test]
+    fn rfc7873_s646_only_the_first_cookie_option_counts() {
+        let good = option(10, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let short = option(10, &[1, 2, 3]);
+        let kinds = |opts: &[Vec<u8>]| {
+            let raw = query_with_opt(&opts.concat());
+            let view = parse_query(&raw).unwrap();
+            (view.edns_options, view.edns_hop_options, view.edns_bad_ecs)
+        };
+        // A later, malformed COOKIE is ignored: no FORMERR flag, no shared option.
+        assert_eq!(kinds(&[good.clone(), short.clone()]), (false, true, false));
+        assert_eq!(kinds(&[good, short.clone(), short]), (false, true, false));
+    }
+
+    fn name_with_first_label(len: u8) -> Vec<u8> {
+        let mut name = vec![len];
+        name.extend(std::iter::repeat_n(b'x', usize::from(len)));
+        name.push(0);
+        name
+    }
+
+    fn response_with_owner(owner: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        raw.extend_from_slice(owner);
+        raw.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        raw
+    }
+
+    #[test]
+    fn rfc9267_s427_label_length_octet_is_1_to_63() {
+        for len in 1u8..=63 {
+            let name = name_with_first_label(len);
+            assert!(parse_query(&query(true, &name)).is_some(), "query label {len}");
+            assert!(normalize_upstream(&response_with_owner(&name)).is_some(), "response label {len}");
+        }
+        for len in 64u8..=191 {
+            let name = name_with_first_label(len);
+            assert!(parse_query(&query(true, &name)).is_none(), "query label {len}");
+            assert!(normalize_upstream(&response_with_owner(&name)).is_none(), "response label {len}");
+        }
+        // 0 is the terminator, not a label: a bare root name is a valid name.
+        assert!(parse_query(&query(true, &[0])).is_some());
+        assert!(normalize_upstream(&response_with_owner(&[0])).is_some());
+    }
+
+    #[test]
+    fn rfc9267_s574_every_record_count_must_match_the_data() {
+        let valid = full_response();
+        assert!(normalize_upstream(&valid).is_some(), "control");
+        for (at, name) in [(5usize, "qdcount"), (7, "ancount"), (9, "nscount"), (11, "arcount")] {
+            for delta in [-1i32, 1] {
+                let mut raw = valid.clone();
+                raw[at] = (i32::from(raw[at]) + delta) as u8;
+                assert!(normalize_upstream(&raw).is_none(), "{name} {delta:+}");
+            }
+        }
+    }
+
+    #[test]
+    fn rfc9267_s575_huge_counts_are_rejected_against_a_short_packet() {
+        for at in [4usize, 6, 8, 10] {
+            let mut header_only = vec![0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+            header_only[at..at + 2].copy_from_slice(&[0xff, 0xff]);
+            assert!(normalize_upstream(&header_only).is_none(), "header only, count at {at}");
+            let mut truncated = full_response();
+            truncated[at..at + 2].copy_from_slice(&[0xff, 0xff]);
+            assert!(normalize_upstream(&truncated).is_none(), "truncated, count at {at}");
+        }
+    }
+
+    /// NXDOMAIN to "a." whose authority holds one NSEC with a 32-byte bitmap
+    /// (window 0) carrying the given set bits.
+    fn nsec_response(bits: &[u16]) -> Vec<u8> {
+        let mut bitmap = [0u8; 32];
+        for &bit in bits {
+            bitmap[usize::from(bit / 8)] |= 0x80 >> (bit % 8);
+        }
+        let mut rdata = vec![0, 0, 32];
+        rdata.extend_from_slice(&bitmap);
+        let mut raw = vec![0x12, 0x34, 0x81, 0x83, 0, 1, 0, 0, 0, 1, 0, 0, 1, b'a', 0, 0, 1, 0, 1];
+        raw.extend_from_slice(&[0xc0, 12, 0, 47, 0, 1, 0, 0, 0, 60]);
+        raw.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&rdata);
+        raw
+    }
+
+    fn assert_relayed_unchanged(raw: &[u8]) {
+        match normalize_upstream(raw) {
+            Some(std::borrow::Cow::Borrowed(out)) => assert_eq!(out, raw),
+            other => panic!("pseudo-type bits must be ignored and the bytes relayed untouched: {other:?}"),
+        }
+        assert!(hickory_view(raw).is_some(), "still decodable");
+    }
+
+    #[test]
+    fn rfc9824_s404_pseudo_type_bits_in_an_nsec_bitmap_are_ignored_on_read() {
+        // OPT 41, TKEY 249, TSIG 250, IXFR 251, AXFR 252, ANY 255, plus NSEC 47.
+        assert_relayed_unchanged(&nsec_response(&[41, 47, 249, 250, 251, 252, 255]));
+    }
+
+    #[test]
+    fn rfc9824_s410_nxname_with_pseudo_type_bits_is_relayed_unchanged() {
+        assert_relayed_unchanged(&nsec_response(&[41, 47, 128, 249, 250]));
+    }
+}
+
+#[cfg(test)]
+mod rfc_tests_c {
+    use super::*;
+
+    const GOOD_ECS: (u16, &[u8]) = (8, &[0, 1, 24, 0, 192, 0, 2]);
+    // Family 7 does not exist (RFC 7871 section 6).
+    const BAD_ECS: (u16, &[u8]) = (8, &[0, 7, 24, 0, 192, 0, 2]);
+    const PADDING: (u16, &[u8]) = (12, &[0, 0, 0, 0]);
+    const UNKNOWN: (u16, &[u8]) = (0xfde9, &[1, 2, 3]);
+
+    fn qname() -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in ["example", "com"] {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    fn opt_record(options: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut rdata = Vec::new();
+        for (code, data) in options {
+            rdata.extend_from_slice(&code.to_be_bytes());
+            rdata.extend_from_slice(&(data.len() as u16).to_be_bytes());
+            rdata.extend_from_slice(data);
+        }
+        let mut out = vec![0, 0, 41, 0x04, 0xd0, 0, 0, 0, 0];
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        out.extend_from_slice(&rdata);
+        out
+    }
+
+    /// A query for example.com A with one OPT carrying `options` in order.
+    fn query_with(options: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut raw = vec![0xbe, 0xef, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1];
+        raw.extend_from_slice(&qname());
+        raw.extend_from_slice(&[0, 1, 0, 1]);
+        raw.extend_from_slice(&opt_record(options));
+        raw
+    }
+
+    /// An upstream answer for example.com A, with an OPT carrying `options`.
+    fn response_with(options: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut raw = vec![0xbe, 0xef, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 1];
+        raw.extend_from_slice(&qname());
+        raw.extend_from_slice(&[0, 1, 0, 1]);
+        raw.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4, 192, 0, 2, 1]);
+        raw.extend_from_slice(&opt_record(options));
+        raw
+    }
+
+    /// RFC 6891 section 6.1.2: "Each option MUST be treated as a bit field"
+    /// and OPTION-DATA "MUST be treated as a bit field". Whatever bytes the
+    /// data holds must neither be interpreted (as text, as a length, as
+    /// anything) nor make the message fail, and an option this forwarder does
+    /// not understand must be ignored, in both directions.
+    #[test]
+    fn rfc6891_s407_s429_option_data_is_an_opaque_bit_field() {
+        let long: Vec<u8> = (0..1500u32).map(|i| (i * 7 % 256) as u8).collect();
+        let payloads: [&[u8]; 7] = [&[], &[0], &[0xff], &[0xff, 0xfe, 0x80, 0xc3, 0x28], &[0; 40], &[0xff; 40], &long];
+        let bare_response = response_with(&[]);
+        let mut bare_answer = bare_response.clone();
+        assert!(present_for_client(&mut bare_answer, true, false, false, 1232));
+        for code in [0u16, 3, 100, 0xfde9, 0xffff] {
+            for data in payloads {
+                // Client direction: accepted, classified only by code, forwarded
+                // unchanged as opaque bytes (RFC 5625 §3).
+                let raw = query_with(&[(code, data)]);
+                let view =
+                    parse_query(&raw).unwrap_or_else(|| panic!("option {code} with {} bytes rejected", data.len()));
+                assert!(view.edns_options && !view.edns_hop_options && !view.edns_bad_ecs);
+                let forwarded = upstream_query(&raw).unwrap();
+                let mut encoded = code.to_be_bytes().to_vec();
+                encoded.extend_from_slice(&u16::try_from(data.len()).unwrap().to_be_bytes());
+                encoded.extend_from_slice(data);
+                assert!(
+                    forwarded.windows(encoded.len()).any(|window| window == encoded),
+                    "option {code} was not forwarded unchanged"
+                );
+                // Upstream direction: valid wire, relayed bytes unchanged, then dropped for the client.
+                let response = response_with(&[(code, data)]);
+                let normal = normalize_upstream(&response).unwrap_or_else(|| panic!("upstream option {code} rejected"));
+                assert_eq!(normal.as_ref(), response.as_slice());
+                let mut answer = response.clone();
+                assert!(present_for_client(&mut answer, true, false, false, 1232));
+                assert_eq!(answer, bare_answer, "upstream option {code} reached the client");
+                // Between two other options it is skipped by its length, not its content.
+                let raw = query_with(&[PADDING, (code, data), GOOD_ECS]);
+                let view = parse_query(&raw).unwrap();
+                assert!(view.edns_hop_options && !view.edns_bad_ecs);
+                let mut answer = response_with(&[PADDING, (code, data), (15, &[0, 22])]);
+                assert!(normalize_upstream(&answer).is_some());
+                assert!(present_for_client(&mut answer, true, false, false, 1232));
+                // Only the EDE option survives, re-attributed: info code 22 then "upstream".
+                assert!(answer.ends_with(&[0, 15, 0, 10, 0, 22, b'u', b'p', b's', b't', b'r', b'e', b'a', b'm']));
+            }
+        }
+    }
+
+    /// RFC 6891 section 6.1.2: options "have the same effect regardless of
+    /// ordering in the RDATA wire encoding". A malformed ECS first, in the
+    /// middle or last must classify, key, forward and answer identically.
+    #[test]
+    fn rfc6891_s431b_option_order_has_no_effect() {
+        fn orders(items: &[(u16, &'static [u8])]) -> Vec<Vec<(u16, &'static [u8])>> {
+            if items.len() <= 1 {
+                return vec![items.to_vec()];
+            }
+            let mut out = Vec::new();
+            for i in 0..items.len() {
+                let mut rest = items.to_vec();
+                let first = rest.remove(i);
+                for mut tail in orders(&rest) {
+                    tail.insert(0, first);
+                    out.push(tail);
+                }
+            }
+            out
+        }
+        let summary = |raw: &[u8]| {
+            let view = parse_query(raw).unwrap();
+            let mut key = [0u8; MIN_CANONICAL_BUFFER];
+            let len = canonical_key(&view, &mut key).unwrap();
+            (
+                (view.edns_options, view.edns_hop_options, view.edns_bad_ecs),
+                key[..len].to_vec(),
+                upstream_query(raw).unwrap(),
+                minimal_error_response(raw, 1).unwrap(),
+            )
+        };
+        let with_bad = [BAD_ECS, GOOD_ECS, PADDING, UNKNOWN];
+        let without_bad = [GOOD_ECS, PADDING, UNKNOWN, (10, &[1, 2, 3, 4, 5, 6, 7, 8][..])];
+        for (set, bad) in [(with_bad, true), (without_bad, false)] {
+            let all = orders(&set);
+            assert_eq!(all.len(), 24);
+            let reference = summary(&query_with(&all[0]));
+            assert_eq!(reference.0, (true, true, bad));
+            for order in &all {
+                let got = summary(&query_with(order));
+                assert_eq!(
+                    got,
+                    reference,
+                    "order {:?} behaves differently",
+                    order.iter().map(|o| o.0).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }

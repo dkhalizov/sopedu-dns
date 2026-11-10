@@ -2,10 +2,11 @@
 
 ## Trademarks
 
-AdGuard, AdGuard Home, Pi-hole, dnsmasq and any other product names in this
-repository are trademarks of their owners. We use them only to describe
-compatibility or to name products in comparisons. sopedu-dns isn't affiliated
-with, endorsed by or derived from any of them. We use no logos.
+AdGuard, AdGuard Home, Pi-hole, dnsmasq, Unbound, Blocky, Numa and any other
+product names in this repository are trademarks of their owners. We use them
+only to describe compatibility or to name products in comparisons. sopedu-dns
+isn't affiliated with, endorsed by or derived from any of them. We use no
+logos.
 
 ## Standards
 

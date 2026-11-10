@@ -13,9 +13,11 @@ it is a caching forwarder. It is not an authoritative server, it does not
 perform iterative recursion, and it does not validate DNSSEC signatures;
 validation is left to the clients.
 
-Inbound DoH/DoT/DoQ, zone transfer, dynamic update, DSO, mDNS, DNS64 and
-authenticated client transactions are outside the home profile. A request for
-one of them must get a documented response, never an accidental parser failure.
+Inbound DoH/DoT/DoQ, dynamic update, DSO, mDNS and DNS64 are outside the home
+profile. A request for one of them must get a documented response, never an
+accidental parser failure. Zone transfers and TSIG, SIG(0) or TKEY
+transactions are not served here either, only proxied unchanged to an upstream
+(L5).
 Deployment topology, HA and cutover procedures are outside this spec. IPv6
 renumbering (RFC 9096) is a router behaviour; its effect on `listen` and
 `allowed_clients` is covered in the configuration reference.
@@ -65,13 +67,14 @@ upstream answers are checked against the blocklists as described in L7.
 **P3: PROFILE.** Ordinary upstream responses MUST be treated as complete
 messages. We do not extract arbitrary Additional records to answer other
 questions, chase referrals or synthesize subtree negatives, so the cache stays
-a packet cache and never acts as an incomplete iterative resolver. Replies
-from the plaintext fallback are untrusted: an Answer RR whose owner is off the
-question/CNAME/DNAME chain makes the reply invalid (a failed attempt),
-Authority keeps only SOA, NS, NSEC, NSEC3 and RRSIG at or above the chain, and
-Additional keeps only OPT. DoH replies are not scrubbed. Setting
-`trust_plain_upstreams = true` (default false) treats plain servers as trusted
-primaries, with no scrubbing and no S1 plaintext limits. RFC 5452 checks always
+a packet cache and never acts as an incomplete iterative resolver. Upstream
+replies, DoH and plaintext alike, are scrubbed (RFC 5452 §6): an Answer RR
+whose owner is off the question/CNAME/DNAME chain makes the reply invalid (a
+failed attempt), Authority keeps only SOA, NS, NSEC, NSEC3 and RRSIG at or
+above the chain (no NS in a negative answer, RFC 2308 §2.1 and §2.2.1), and
+Additional keeps only OPT. Setting `trust_plain_upstreams = true` (default
+false) treats plain servers as trusted primaries, with no scrubbing of their
+replies and no S1 plaintext limits. RFC 5452 checks always
 apply.
 
 ## 3. Wire parsing and errors
@@ -110,11 +113,13 @@ dropped under the admission policy.
 | Unsupported opcode | NOTIMP; keep ID and opcode in the safe error header | RFC 8906 §§3–5 |
 | Malformed ordinary QUERY with usable header (including a name compression pointer into the header, target < 12) | FORMERR; never forwarded; TCP may close if framing recovery is unsafe | RFC / PROFILE |
 | Multiple OPT, invalid OPT structure | FORMERR with a safe OPT where required | RFC 6891 |
-| Unsupported EDNS version (checked before QDCOUNT = 0, AXFR/IXFR/TKEY, NXNAME, meta-TYPE and TSIG policy) | BADVERS with supported EDNS version 0 | RFC 6891 §6.1.3 |
-| AXFR/IXFR or TKEY query | REFUSED; never start transfer/key negotiation | PROFILE |
+| Unsupported EDNS version (checked before QDCOUNT = 0, AXFR/IXFR/TKEY, NXNAME and signature policy) | BADVERS with supported EDNS version 0 | RFC 6891 §6.1.3 |
+| AXFR query over UDP | REFUSED; a transfer needs a stream | RFC 5936 §4.2 |
+| AXFR or IXFR query over TCP | Streamed from a plain `fallback` server and relayed message by message, never cached; REFUSED when no plain server is configured | RFC 5936, RFC 5625 §4.5 |
+| TKEY query | Proxied unchanged and never cached, because it is a meta type | RFC 5625 §4.3 |
 | Explicit NXNAME (TYPE128) query | FORMERR, no upstream query | RFC 9824 §3.5 |
-| Reserved or meta-TYPE QTYPE: 0, OPT (41), TSIG (250), unassigned 129–248 (MAILB/MAILA forward normally) | FORMERR, no upstream query | RFC 6895 §3.1 |
-| TSIG or SIG(0) authenticated request | REFUSED; authentication is unsupported, so a signed request never gets a success | PROFILE |
+| Every other QTYPE, including 0, OPT (41), TSIG (250), the unassigned range 129–248 and MAILB/MAILA | Proxied (RFC 5625 §4.3); non-IN classes and meta types are never cached; QTYPE=ANY is the exception and keeps the L2 minimal answer | RFC 5625 §4.3 |
+| TSIG or SIG(0) authenticated request whose signature closes the Additional section | Forwarded byte for byte, never cached; name policy first, so a blocked or local name is REFUSED; a signature out of place or repeated is FORMERR | RFC 5625 §4.5, RFC 8945 §5.2, RFC 2931 §3 |
 
 The zero-question distinction and multiple-question requirement come from
 [RFC 9619 §4](https://www.rfc-editor.org/rfc/rfc9619.html#section-4).
@@ -126,16 +131,20 @@ unchanged. A rebuilt message MUST preserve opaque RDATA and re-encode any
 supported compressed names correctly; it MUST NOT transplant old compression
 offsets. The question may be patched in place for case only after its layout is
 proven equal. Otherwise rebuild the message safely or skip the cache/sharing
-optimization. See [RFC 3597 §§3–4](https://www.rfc-editor.org/rfc/rfc3597.html#section-4).
+optimization. Known types whose RDATA has a fixed format (the RFC 1035 types,
+DNSSEC, SVCB, CAA, TLSA, LOC, CERT, SSHFP, URI and the others listed in the
+code) are checked against it, and a reply with malformed RDATA is invalid
+(RFC 9267 §2). See [RFC 3597 §§3–4](https://www.rfc-editor.org/rfc/rfc3597.html#section-4).
 
 **W5: RFC / PROFILE.** An upstream message is invalid when its Answer or
 Authority holds an OPT or an RR of a Q-TYPE or meta-TYPE (128 through 255:
-TKEY, TSIG, IXFR, AXFR, MAILB, MAILA, ANY and the unassigned range), or when
-its Answer holds an RR in a class other than the question's. L2 never forwards
-QCLASS ANY, so an answer to it is never usable. An invalid message is a failed
-attempt: nothing is relayed or cached, and a plain attempt fails at once
-instead of waiting for a better datagram. A TSIG in Additional is dropped (W4).
-A foreign-class Authority RR is ignored and cannot make a negative usable (N2).
+TKEY, TSIG, IXFR, AXFR, MAILB, MAILA, ANY and the unassigned range), unless an
+unassigned type (129–248) answers a query for that exact type in the Answer
+section, or when its Answer holds an RR in a class other than the question's.
+An invalid message is a failed attempt: nothing is relayed or cached, and a
+plain attempt fails at once instead of waiting for a better datagram. A TSIG
+in Additional is dropped (W4). A foreign-class Authority RR is ignored and
+cannot make a negative usable (N2).
 See [RFC 6895 §3.1](https://www.rfc-editor.org/rfc/rfc6895.html#section-3.1).
 
 ## 4. EDNS and response presentation
@@ -164,18 +173,22 @@ dropped (RFC 1035 §4.1 gives a standard query nothing to carry there); such a
 query is still answered, uncached and uncoalesced. Every upstream query
 carries a fresh OPT built by the forwarder: our payload size, version 0, the
 client's DO and Compact Answers OK (RFC 9824) flags when the client set them,
-since they ask for data we relay, every other flag zero (RFC 6891 §6.1.4) and no options. A query
-without OPT stays without one unless `dnssec = "always_upstream"` adds DO.
+since they ask for data we relay, every other flag zero (RFC 6891 §6.1.4). An
+unknown client option is forwarded unchanged inside that OPT, so an extension
+the forwarder does not know about operates as if the proxy were not there
+(RFC 5625 §3). A query without OPT stays without one unless
+`dnssec = "always_upstream"` adds DO.
 
-No client option is supported end to end (NSID would name the upstream, not
-this server). Local responses ignore unsupported options and never reflect
+The forwarder does not interpret an unknown option (NSID names the upstream,
+not this server). Local responses ignore unsupported options and never reflect
 arbitrary request data. Hop-scoped client options (ECS 8, Cookie 10, TCP
-keepalive 11, Padding 12) are never echoed and do not affect caching or
-coalescing, because they describe the client-to-forwarder hop
-(RFC 7873 §5.2.1, RFC 8932 §5.3.1, RFC 7830). A malformed client ECS option (family,
-prefix, scope or address bits; RFC 7871 §6) gets FORMERR. A query with any
-other option or with unfamiliar flags bypasses the shared cache. We do not
-terminate the ECS, Cookie or padding protocols ourselves.
+keepalive 11, Padding 12) are removed, never echoed, and do not affect caching
+or coalescing, because they describe the client-to-forwarder hop
+(RFC 7873 §5.2.1, RFC 7871 §7.5, RFC 7828 §3.2.1, RFC 7830 §6). A malformed
+client ECS option (family, prefix, scope or address bits; RFC 7871 §6) gets
+FORMERR. A query with any other option or with unfamiliar flags bypasses the
+shared cache. We do not terminate the ECS, Cookie or padding protocols
+ourselves.
 
 **E3: RFC / PROFILE.** A response MUST use the current client's ID and question.
 We echo the client's question case for interoperability. Every client reply,
@@ -210,6 +223,13 @@ no Answer or Authority RRs, and AD=0. If the complete answer is otherwise
 cacheable, keep it for a later TCP request. A truncated upstream answer MUST
 NOT be inserted as a complete answer. See
 [RFC 2181 §9](https://www.rfc-editor.org/rfc/rfc2181.html#section-9).
+
+UDP replies leave with the don't-fragment flag where that is safe: IPv6 on
+Linux and macOS, and IPv4 on macOS. Linux offers DF for IPv4 UDP only through
+path MTU discovery, which RFC 9715 Appendix C calls harmful, so IPv4 there
+relies on the `udp_max_payload` cap. A reply the path refuses (EMSGSIZE) is
+sent again as the minimal TC=1 response above. See
+[RFC 9715 §3.1](https://www.rfc-editor.org/rfc/rfc9715.html#section-3.1).
 
 **T3: RFC / PROFILE.** TCP messages carry a two-byte length prefix in network
 byte order. Fragmented and coalesced reads, successive requests and pipelining
@@ -275,9 +295,9 @@ query keeps its RRSIG answer. OPT is handled separately. See
 infer it locally. AD is kept only from an explicitly trusted, authenticated
 upstream, and only when the client set AD or DO. We never set AD=1 ourselves.
 This profile clears AD on plaintext fallback answers, synthesized answers,
-truncated answers and every stale answer. A cache without trustworthy
-validation-lifetime metadata MUST clear cached AD instead of asserting that it
-is still valid. This trust policy is stricter than plain wire relay. See
+truncated answers and every stale answer. A fresh cache hit keeps the AD of
+the trusted answer it holds: a validating upstream caps TTLs at its signatures'
+expiry (RFC 4035 §5.3.3). This trust policy is stricter than plain wire relay. See
 [RFC 6840 §§5.7–5.8](https://www.rfc-editor.org/rfc/rfc6840.html#section-5.7)
 and [RFC 4035 §4.9.3](https://www.rfc-editor.org/rfc/rfc4035.html#section-4.9.3).
 
@@ -302,8 +322,11 @@ upstream ID. DoH replies are matched mainly by their HTTP exchange. Mismatched
 replies and late losers are ignored and MUST NOT populate cache state.
 
 **U2: RFC / PROFILE.** Ordinary upstream UDP queries use unpredictable IDs
-across the full 16-bit space and unpredictable ephemeral source ports, with
-multiple ports for concurrent queries. The reply must come from the expected
+across the full 16-bit space and unpredictable source ports, with multiple
+ports for concurrent queries. Ports are drawn by the server from 1024..=65535,
+a range as large as RFC 5452 §9.2 asks for, minus
+`upstream_source_ports_exclude` and the server's own `listen` and `ui_listen`
+ports. The reply must come from the expected
 peer and carry the expected question. A small persistent socket pool is not an
 acceptable default substitute for port entropy. We use a connected socket per
 attempt; pooling would need evidence that it is equally safe. If sockets are
@@ -321,8 +344,10 @@ uses one attempt per endpoint and transport. See
 **U4: RFC / PROFILE.** DoH uses HTTPS POST, `application/dns-message` for
 Content-Type and Accept, certificate and hostname verification, and bodies of
 at most 65,535 DNS octets with no TCP length prefix. Ordinary DoH requests use
-DNS ID 0, as recommended. A 2xx HTTP response can carry a DNS failure, so the
-DNS result is classified separately. The HTTP `Age` is applied before relaying
+DNS ID 0, as recommended. A redirect is not followed: a 3xx fails the attempt
+like any other non-success status, so a query only reaches a configured URI
+(our policy; RFC 8484 §3 gives other URIs no resolution privilege). A 2xx HTTP
+response can carry a DNS failure, so the DNS result is classified separately. The HTTP `Age` is applied before relaying
 or caching: it is subtracted, saturating, from RR lifetimes and the negative
 lifetime, never from OPT flags or RDATA. A missing Age counts as zero; a
 malformed or overflowing Age rejects the upstream result. See
@@ -356,8 +381,10 @@ status, a non-DNS content type, invalid wire, or a request reset after it was
 sent (an HTTP/2 RST_STREAM, or the connection closed under it) from a reachable
 DoH upstream never reaches plaintext; otherwise a client could pick names that
 downgrade its own queries. A well-formed DNS failure RCODE from a reachable DoH
-upstream moves on to the next DoH upstream only. A SERVFAIL carrying a DNSSEC
-validation EDE (5 to 12, RFC 8914 §4) is final and is relayed.
+upstream moves on to the next DoH upstream only. A SERVFAIL is a failed
+attempt whatever its EDE says, including a DNSSEC validation EDE (RFC 8914
+§6): the EDE is diagnostic and never stops the next attempt. When no upstream
+succeeds, the last SERVFAIL is relayed.
 
 Upstream health MUST NOT be steerable by the names clients ask for. It counts
 only name-independent transport failures (TCP connect or TLS failures; for a
@@ -548,8 +575,9 @@ stale positive entry for the key is evicted. See
 **N3: RFC / PROFILE.** For DO-enabled clients, the required denial and
 authority records are preserved with their aged TTLs. NODATA applies to
 name/type/class; NXDOMAIN applies to the terminal name/class. The packet cache
-keeps exact-question variants and never reuses a packet for another QTYPE.
-Cross-type reuse would need separate negative metadata and correct rendering.
+keeps exact-question variants. The one cross-type reuse is a fresh NXDOMAIN,
+which answers every QTYPE of its name, and of the chain's last name after a
+CNAME from DoH or a trusted plain server, question rewritten (RFC 2308 §8, RFC 8020 §2).
 
 **N4: PROFILE.** Never infer a descendant NXDOMAIN from a cached packet or from
 a filter's synthetic NXDOMAIN. Subtree cuts and aggressive denial are deferred;
@@ -625,13 +653,14 @@ uncacheable and local-policy answers are never prefetched.
 one: important allow > important block > ordinary allow > ordinary block.
 Exact hosts-format entries do not become suffix rules. Exact rewrites take
 precedence over the most specific wildcard rewrite. Matching respects label
-boundaries. Decisions are exact by default: a probabilistic fingerprint table
-may not silently turn an allow or block decision into a false positive. Rule
-syntax and priority are our own policy; no IETF adblock specification exists
-for them.
+boundaries. Rules are stored as 64-bit fingerprints, not names, so two names
+whose hashes collide are indistinguishable (about 3e-14 per probe at 516k
+rules; see docs/configuration.md). Rule syntax and priority are our own policy;
+no IETF adblock specification exists for them.
 
-**L2: RFC / PROFILE.** Diagnostic names and CHAOS get REFUSED, and the refusal
-takes precedence. QTYPE=ANY is never forwarded. Rewrites, local zones,
+**L2: RFC / PROFILE.** The diagnostic names `version.bind`, `id.server` and
+`hostname.bind` get REFUSED in every class, and the refusal takes precedence.
+QTYPE=ANY is never forwarded. Rewrites, local zones,
 special-use names, the blocklist and `.local` answer ANY like any other type.
 After them, ANY gets the RFC 8482 §4.2 minimal answer: one synthesized HINFO RR
 at the question name with CPU "RFC8482", an empty OS and TTL 10, in the
@@ -649,9 +678,9 @@ name in every class (RFC 7686 §2 asks NXDOMAIN for all `.onion` queries; RFC
 blocked or local name upstream. IN address data is never copied into another
 class: a rewrite or `localhost` asked in another class gets NODATA, and local
 records take the question's class (IN for QCLASS ANY or NONE). A query in QCLASS
-ANY (255) or NONE (254), which are query-only classes (RFC 6895 §3.2), that no
-name decision answered gets REFUSED and is never forwarded. Other data classes
-(except CH) are forwarded.
+ANY (255) or NONE (254), which are query-only classes (RFC 6895 §3.2), and
+every data class other than IN is proxied and never cached (RFC 5625 §4.3);
+name policy still applies in every class.
 
 **L3: RFC / PROFILE.** By default, private reverse names are answered from the
 empty local zones below. Matching uses complete label suffixes, never arbitrary
@@ -668,9 +697,10 @@ and [RFC 6303 §7](https://www.rfc-editor.org/rfc/rfc6303.html#section-7).
 Answers carry correct SOA ownership, AA and negative TTL. This profile uses
 TTL/MINIMUM 10, an NS target and SOA MNAME equal to the zone apex, and SOA RNAME
 `nobody.invalid.` unless configured otherwise. The apex never gets a blanket
-NXDOMAIN. Per-zone overrides are supported. We cover a home subset, not every
-zone listed in
-[RFC 6303 §§3–4](https://www.rfc-editor.org/rfc/rfc6303.html#section-3).
+NXDOMAIN. The opt-out is global (`private_ptr = "forward"`) or per zone
+(`forward_reverse_zones`), as
+[RFC 6303 §3](https://www.rfc-editor.org/rfc/rfc6303.html#section-3) asks.
+Every zone listed in RFC 6303 §4 is covered, plus the extensions below.
 
 | Scope | Empty-zone suffixes in the home profile |
 |---|---|
@@ -713,11 +743,25 @@ cached:
 `ipv4only.arpa` and its reverse names are forwarded: a forwarder without DNS64
 SHOULD NOT treat them specially (RFC 8880 §7.1).
 
-**L5: PROFILE.** Authenticated TSIG/SIG(0) requests are explicitly unsupported
-(W3). DNSSEC RRSIG data is never mistaken for a transaction signature. A future
-authenticated pass-through mode would need its own byte-preservation, ID and
-transport tests before filtering, TTL patching or cache sharing could touch it.
-See [RFC 8945](https://www.rfc-editor.org/rfc/rfc8945.html) and
+**L5: RFC / PROFILE.** A request whose Additional section ends in TSIG or
+SIG(0) is forwarded byte for byte, never cached, and its reply is relayed
+unchanged: the server neither verifies nor generates signatures, so any change
+would break them (RFC 5625 §4.5). Name policy runs first, so a blocked or
+local name is REFUSED and a signed message never reaches an upstream for it.
+A signature that is not final, or a second signature of either kind (one
+TSIG or one SIG(0), never both), makes the request malformed (FORMERR,
+RFC 8945 §5.2, RFC 2931 §3). Over UDP, a relayed reply larger than the
+client's limit cannot be trimmed without breaking its signature, so the client
+gets TC=1 with no records and retries over TCP (RFC 5625 §4.4). DNSSEC RRSIG
+data is never mistaken for a transaction signature. TKEY is proxied like any
+other QTYPE. AXFR and IXFR over TCP are streamed from a plain `fallback`
+server, at most 16 at once, and relayed message by message unparsed. Other queries on the
+same client connection, including further transfers, are answered while a
+transfer runs (RFC 5936 §4.2 MUST); AXFR over UDP is
+REFUSED (RFC 5936 §4.2), and a transfer with no plain server is REFUSED
+because DoH cannot carry a stream. IXFR over UDP is proxied like a
+single-message query and never cached. The server does not check any signature
+it relays. See [RFC 8945](https://www.rfc-editor.org/rfc/rfc8945.html) and
 [RFC 2931 §3](https://www.rfc-editor.org/rfc/rfc2931.html#section-3).
 
 **L7: PROFILE.** CNAME cloaking protection is on by default
@@ -733,6 +777,11 @@ policy SOA, TTL/MINIMUM 10) when both of these hold:
   link cannot hide a blocked target behind a break in the chain.
 - The client is not exempt (`no_filter_clients`, `no_filter_macs`), the same
   test as for a direct block.
+
+A reply that W5 already rejects (a contradictory shape, an alias loop or an
+off-chain Answer record) is a failed attempt: the client gets SERVFAIL and no
+data from it, so a blocked target in such a reply is never delivered either.
+The flat pass above decides only a reply that otherwise survives.
 
 If an `@@` rule allows the query name itself (its own rule or one on a parent
 domain), the check is skipped: allowing a name allows what it aliases to. A
@@ -851,7 +900,7 @@ key must not change the meaning of existing ones.
 | Retry-After pause | as sent, capped at 60 s |
 | Single-flight waiters | 128 per key, 4096 total; excess resolves on its own under O7 and the pool bound |
 | Reusable cache | Existing entry bound plus 4 MiB charged-byte budget |
-| Failure cache | Separate 1 MiB and 4096-entry limits; 5 s initially, backoff to 30 s |
+| Failure cache | Separate 1 MiB and 4096-entry limits; 5 s initially, backoff to 30 s. A mark is kept at least 1 s: when the cache is full of younger marks, a new failure is not stored |
 | Failure TTL validation | 1–300 s; eviction may occur under bounded resource pressure |
 | Positive TTL cap | 604,800 s; no upward floor |
 | Negative TTL cap | 3600 s; no upward floor; original zero remains zero |
@@ -904,13 +953,13 @@ cache state and response contents, not only that a parser accepts the output.
 | A28 | S4 | Hits near prefetch threshold produce one refresh; failed refresh enters backoff; zero-TTL and policy answers never prefetch |
 | A29 | P2, L1–L2 | Priority, parent boundaries, exact hosts, wildcard specificity, ANY/diagnostic precedence and IN-only rewrite behavior |
 | A30 | L3–L4, L6 | Reverse-zone descendant/apex SOA/NS/NODATA, private-route failure without public leak, local home.arpa, and the public DS+DO exception at every local zone apex |
-| A31 | L5 | TSIG/SIG(0) are refused explicitly; DNSSEC RRSIG data is not mistaken for transaction authentication |
+| A31 | L5 | TSIG/SIG(0) messages are forwarded unchanged and never cached; a signature out of place is FORMERR; DNSSEC RRSIG data is not mistaken for transaction authentication |
 | A32 | C3, O1–O3 | Entry/byte limits, distinct in-flight keys and failure-cache limits; large/malformed lists cannot exceed streaming limits |
 | A33 | O2 | One bad list keeps last good copy; malformed config retains prior generation; persisted-list boot works without public network |
 | A34 | O4 | Upstream outage preserves local/stale service; minimal health works with UI disabled; shutdown drains or cancels within budget |
 | A35 | C4, N1 | Replace A/AAAA with CNAME or terminal NXDOMAIN: old contradictory stale variants disappear without invalidating the alias as nonexistent |
 | A36 | L7 | Blocked CNAME/DNAME target on the cold relay, the warm UDP hit, TCP, a stale hit and a refresh; allowed query name, exempt client and knob off are served; a rules reload recomputes a cached verdict; off-chain owners and targets count (fail closed), as do names behind a loop, conflict, gap or overlong chain |
-| A37 | W5, U7 | One scripted upstream reply per contradictory shape (NXDOMAIN with an address at the name, NOERROR with only a TXT for an A question, NXDOMAIN whose alias tail is answered) and per meta-TYPE (128, 248, TKEY, TSIG, IXFR, AXFR, ANY, OPT in Answer) or foreign Answer class (ANY, NONE, CH): SERVFAIL, nothing cached, a repeat goes upstream again; NXDOMAIN after a CNAME and ANY/TXT questions stay valid |
+| A37 | W5, U7 | One scripted upstream reply per contradictory shape (NXDOMAIN with an address at the name, NOERROR with only a TXT for an A question, NXDOMAIN whose alias tail is answered) and per meta-TYPE (128, 248, TKEY, TSIG, IXFR, AXFR, ANY, OPT in Answer; an unassigned 129–248 answer is valid only for a query of that exact type) or foreign Answer class (ANY, NONE, CH): SERVFAIL, nothing cached, a repeat goes upstream again; NXDOMAIN after a CNAME and ANY/TXT questions stay valid |
 | A38 | U8, U9 | A 3000-byte UDP reply to a query advertising 1232 is not the answer and TCP is asked; a DoH 429/503 with `Retry-After: 120` gets one request for 20 names while another upstream serves and is capped at 60 s; on the last usable upstream a client-drawn pause fails no other query, an HTTP-date works, a missing or bad value keeps the ordinary backoff |
 | A39 | O6 | A reply held past `udp_discard_timeout_ms` is not sent over UDP but is cached and served over TCP; SERVFAIL, hits and `udp_discard_timeout_ms = 0` are unaffected; `dropped` counts discards |
 | A40 | O7 | One host flooding unique names holds at most `upstream_inflight_per_client` misses; its surplus gets TC=1 over UDP (rate limited) and SERVFAIL over TCP, misses held over UDP leave it no extra slots over TCP, another host (including another address in the same IPv6 /64) and cache hits are served, a slot frees when its query ends |
