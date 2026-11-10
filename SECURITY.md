@@ -172,6 +172,9 @@ targets (`fuzz/`) and property tests.
 - Prefer DoH upstreams. Plain fallbacks (off by default) are only as
   trustworthy as the path to them; if you add any, alert on
   `dns_plain_fallback_answers_total`.
+- With a plain fallback, every client in `allowed_clients` can ask it for
+  a zone transfer (AXFR, IXFR) through sopedu-dns. If that server allows
+  transfers by source address, don't let it trust the forwarder's address.
 - Download blocklists over HTTPS.
 - Drop every capability except the one needed to bind port 53
   (`CAP_NET_BIND_SERVICE`), and use a read-only root filesystem.
