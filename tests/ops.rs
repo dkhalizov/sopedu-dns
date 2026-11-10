@@ -273,13 +273,24 @@ fn udp_reply(question: &Message, answer: Message) -> Vec<u8> {
     truncated.to_vec().unwrap()
 }
 
-/// Serves the full `build` answer over TCP on `addr`, the twin of a UDP mock.
+/// A UDP socket and a TCP listener on the same loopback port. The OS picks the
+/// UDP port, and another test may already hold that number for TCP, so retry.
+fn udp_and_tcp_on_one_port() -> (UdpSocket, TcpListener) {
+    (0..50)
+        .find_map(|_| {
+            let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
+            let tcp = TcpListener::bind(udp.local_addr().ok()?).ok()?;
+            Some((udp, tcp))
+        })
+        .expect("a port free for both UDP and TCP")
+}
+
+/// Serves the full `build` answer over TCP on `listener`, the twin of a UDP mock.
 fn tcp_twin(
-    addr: SocketAddr,
+    listener: TcpListener,
     stop: Arc<AtomicBool>,
     build: impl Fn(&Message) -> Message + Send + 'static,
 ) -> thread::JoinHandle<()> {
-    let listener = TcpListener::bind(addr).unwrap();
     listener.set_nonblocking(true).unwrap();
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {
@@ -337,12 +348,12 @@ impl LargeUdpMock {
     }
 
     fn start() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (socket, listener) = udp_and_tcp_on_one_port();
         socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let addr = socket.local_addr().unwrap();
         let queries = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let twin = tcp_twin(addr, stop.clone(), Self::answer);
+        let twin = tcp_twin(listener, stop.clone(), Self::answer);
         let thread = {
             let queries = queries.clone();
             let stop = stop.clone();
@@ -402,12 +413,12 @@ impl LargeTxtUdpMock {
     }
 
     fn start() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (socket, listener) = udp_and_tcp_on_one_port();
         socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let addr = socket.local_addr().unwrap();
         let queries = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let twin = tcp_twin(addr, stop.clone(), Self::answer);
+        let twin = tcp_twin(listener, stop.clone(), Self::answer);
         let thread = {
             let queries = queries.clone();
             let stop = stop.clone();
@@ -3215,14 +3226,14 @@ struct RfcMock {
 impl RfcMock {
     fn start(build: impl Fn(&Message) -> Option<Message> + Send + Sync + 'static) -> Self {
         let build: Arc<MockBuild> = Arc::new(build);
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (socket, listener) = udp_and_tcp_on_one_port();
         socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let addr = socket.local_addr().unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let twin = {
             let build = build.clone();
-            tcp_twin(addr, stop.clone(), move |question| {
+            tcp_twin(listener, stop.clone(), move |question| {
                 build(question)
                     .unwrap_or_else(|| Message::new(question.metadata.id, MessageType::Response, OpCode::Query))
             })
