@@ -67,7 +67,7 @@ serde_json = { version = "1", optional = true }
 # The same safe wrappers carry the IP_PKTINFO control messages of
 # src/udp_pktinfo.rs (Linux and macOS), so the dependency covers both.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-nix = { version = "0.31", features = ["net", "socket", "uio", "resource"] }
+nix = { version = "0.32", features = ["net", "socket", "uio", "resource"] }
 
 [dev-dependencies]
 criterion = "0.8"
