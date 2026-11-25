@@ -1,5 +1,5 @@
 # Static benchmark upstream image: docker build -t upstream-mock:bench bench/upstream-mock
-FROM rust:1.99-alpine@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS build
+FROM rust:1.100-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /b
 COPY Cargo.toml Cargo.lock ./

@@ -4,7 +4,7 @@
 # binaries it already built instead of compiling again.
 ARG BINARIES=build
 
-FROM rust:1.99-alpine@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS build
+FROM rust:1.100-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS build
 RUN apk add --no-cache musl-dev build-base ca-certificates
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -21,7 +21,7 @@ RUN mkdir -p /rootfs/var/lib/sopedu-dns && chmod 0770 /rootfs/var/lib/sopedu-dns
 # `#[cfg(target_os = "linux")]` batched UDP path is actually compiled and
 # exercised. Build explicitly with `docker build --target test .`; this stage
 # is not part of the production image.
-FROM rust:1.99-alpine@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS test
+FROM rust:1.100-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS test
 RUN apk add --no-cache musl-dev build-base ca-certificates
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -36,7 +36,7 @@ RUN cargo test --locked
 # Benchmark stage: the same musl release binary in a Debian userland that
 # has dnsperf and python3. Build explicitly with
 # `docker build --target bench -t sopedu-dns-bench .`.
-FROM rust:1.99-alpine@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS bench-build
+FROM rust:1.100-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS bench-build
 RUN apk add --no-cache musl-dev build-base
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -81,7 +81,7 @@ CMD ["sh"]
 
 # Release images: the static binaries from the release workflow, laid out as
 # dist/amd64/sopedu-dns and dist/arm64/sopedu-dns. Runs on the build host only.
-FROM --platform=$BUILDPLATFORM rust:1.99-alpine@sha256:27cd9befd4a05d6f6eb407c3e28365f5092f008bfc5946207cca76ae5179ef23 AS prebuilt
+FROM --platform=$BUILDPLATFORM rust:1.100-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS prebuilt
 ARG TARGETARCH
 RUN apk add --no-cache ca-certificates
 COPY dist /dist
